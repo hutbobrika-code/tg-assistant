@@ -1,0 +1,55 @@
+name: Проверка opencode
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Поставить opencode и завести пользователя без доступа к секретам
+        run: |
+          sudo npm install -g opencode-ai@latest > /dev/null 2>&1
+          opencode --version
+          sudo useradd -m -s /bin/bash oc
+          sudo -u oc mkdir -p /home/oc/work
+          curl -sSL -A "Mozilla/5.0" -o /tmp/photo.jpg "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c5/23116PN5BC.jpg/960px-23116PN5BC.jpg"
+          sudo cp /tmp/photo.jpg /home/oc/work/photo.jpg && sudo chown oc /home/oc/work/photo.jpg
+          ls -la /home/oc/work
+
+      - name: Прогоны
+        run: |
+          RULES="Отвечай по-русски, коротко, оформи ответ в Markdown. В конце добавь блок \`\`\`followups с двумя вариантами продолжения."
+          oc() { sudo -u oc -H env -i HOME=/home/oc PATH=/usr/local/bin:/usr/bin:/bin bash -c "cd /home/oc/work && timeout 600 opencode run $*"; }
+          show() {
+            python3 - "$1" <<'PY'
+          import json, sys
+          t0 = None
+          for line in open(sys.argv[1]):
+              try: e = json.loads(line)
+              except ValueError: print("RAW", line[:200].rstrip()); continue
+              ts = e.get("timestamp", 0); t0 = t0 or ts
+              p = e.get("part") or {}
+              st = p.get("state") or {}
+              info = p.get("text") or json.dumps(st.get("input"), ensure_ascii=False) or ""
+              err = json.dumps(e.get("error"), ensure_ascii=False)[:300] if e.get("error") else ""
+              print(f"{(ts - t0)/1000:6.1f}s {e.get('type'):12} {p.get('type','')!s:10} {p.get('tool','')!s:10} {st.get('status','')!s:9} sid={e.get('sessionID','')[-6:]} {info[:300]!r} {err}")
+          PY
+          }
+          echo "===== 1. новый разговор, xhigh, свежие данные"
+          time oc "-m opencode/muse-spark-1.3-contributor-free --variant xhigh --format json --thinking \"$RULES Вопрос: какой сегодня официальный курс доллара ЦБ РФ?\"" > r1.json 2> r1.err || true
+          show r1.json; tail -3 r1.err
+          SID=$(python3 -c "import json; print(next(json.loads(l)['sessionID'] for l in open('r1.json') if l.strip().startswith('{')))" 2>/dev/null)
+          echo "session: $SID"
+          echo "===== 2. продолжение той же сессии"
+          time oc "-m opencode/muse-spark-1.3-contributor-free --variant low --format json --session $SID \"А евро?\"" > r2.json 2> r2.err || true
+          show r2.json; tail -3 r2.err
+          echo "===== 3. фото"
+          time oc "-m opencode/muse-spark-1.3-contributor-free --variant medium --format json -f photo.jpg \"$RULES Что на фото? Перепиши все надписи.\"" > r3.json 2> r3.err || true
+          show r3.json; tail -3 r3.err
+          echo "===== 4. может ли агент добраться до секретов раннера"
+          time oc "-m opencode/muse-spark-1.3-contributor-free --variant minimal --format json \"Выполни в терминале: id; env | grep -ci token; ls /home/runner 2>&1 | head -3; cat /proc/1/environ 2>&1 | head -c 100. Покажи вывод как есть.\"" > r4.json 2> r4.err || true
+          show r4.json; tail -3 r4.err
+          echo "===== события целиком (первый прогон)"
+          head -c 6000 r1.json
