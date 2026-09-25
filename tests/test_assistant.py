@@ -5,7 +5,14 @@ from pathlib import Path
 
 from assistant import llm, models
 from assistant.config import settings
-from assistant.markdown import prepare, split_long, thinking_title, without_followups
+from assistant.markdown import (
+    drop_images,
+    prepare,
+    split_long,
+    thinking_title,
+    web_images,
+    without_followups,
+)
 from assistant.store import Store
 
 
@@ -49,6 +56,17 @@ class TestMarkdown(unittest.TestCase):
             self.assertEqual(part.count("```") % 2, 0)
         self.assertEqual("\n".join(parts), text)
 
+    def test_web_images(self):
+        md = ("текст\n\n<tg-collage>\n\n![](https://a.ru/1.jpg)\n"
+              "![](https://b.ru/2.jpg \"подпись\")\n\n</tg-collage>\n\n![](tg://photo?id=img1)")
+        self.assertEqual(web_images(md), ["https://a.ru/1.jpg", "https://b.ru/2.jpg"])
+        one = drop_images(md, ["https://a.ru/1.jpg"])
+        self.assertNotIn("a.ru", one)
+        self.assertIn("b.ru", one)
+        none = drop_images(md)
+        self.assertNotIn("tg-collage", none)
+        self.assertIn("tg://photo?id=img1", none)
+
     def test_thinking_title(self):
         self.assertEqual(thinking_title("**Читаю фото**\n\nтекст\n\n**Считаю площадь**\n\nещё"),
                          "Считаю площадь")
@@ -62,24 +80,92 @@ class TestModels(unittest.TestCase):
         self.assertIsNone(models.effort_for(models.BY_ID["big-pickle"], "high"))
 
 
+class FakePost:
+    # подменяет запросы к модели: на каждый раунд свой список событий
+    def __init__(self, rounds, reject_tools=False):
+        self.rounds = list(rounds)
+        self.bodies = []
+        self.reject_tools = reject_tools
+
+    def __call__(self, path, body, probe=False):
+        self.bodies.append(body)
+        if self.reject_tools and "tools" in body:
+            raise llm.ToolsRejected("tools not supported")
+        yield from self.rounds.pop(0)
+
+
 class TestLLM(unittest.TestCase):
-    def test_responses_body(self):
-        muse = models.get("muse-spark-1.3-contributor-free")
+    def setUp(self):
+        self.real_post = llm.post
+        llm.no_tools.clear()
+
+    def tearDown(self):
+        llm.post = self.real_post
+
+    def run_stream(self, model_id, rounds, **kw):
+        fake = FakePost(rounds, kw.pop("reject_tools", False))
+        llm.post = fake
+        calls = []
+
+        def tools(name, args):
+            calls.append((name, args))
+            return "результат поиска"
+        events = list(llm.stream(models.get(model_id), "sys",
+                                 [{"role": "user", "text": "курс доллара?"}], "high", None, tools))
+        return events, calls, fake.bodies
+
+    def test_responses_tool_round(self):
+        call = {"type": "function_call", "call_id": "c1", "name": "web_search",
+                "arguments": '{"query": "курс"}'}
+        rounds = [
+            [{"type": "response.reasoning_summary_text.delta", "delta": "надо поискать"},
+             {"type": "response.output_item.done", "item": call},
+             {"type": "response.completed", "response": {"output": [call]}}],
+            [{"type": "response.output_text.delta", "delta": "84 ₽"}],
+        ]
+        events, calls, bodies = self.run_stream("muse-spark-1.3-contributor-free", rounds)
+        self.assertEqual(calls, [("web_search", {"query": "курс"})])
+        self.assertIn(("text", "84 ₽"), events)
+        self.assertEqual(bodies[0]["reasoning"], {"effort": "high", "summary": "auto"})
+        self.assertEqual(bodies[1]["input"][-1],
+                         {"type": "function_call_output", "call_id": "c1",
+                          "output": "результат поиска"})
+
+    def test_chat_tool_round(self):
+        rounds = [
+            [{"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "t1",
+                 "function": {"name": "web_search", "arguments": '{"qu'}}]}}]},
+             {"choices": [{"delta": {"tool_calls": [
+                 {"index": 0, "function": {"arguments": 'ery": "x"}'}}]}}]}],
+            [{"choices": [{"delta": {"reasoning_content": "хм", "content": "готово"}}]}],
+        ]
+        events, calls, bodies = self.run_stream("space-bunny-free", rounds)
+        self.assertEqual(calls, [("web_search", {"query": "x"})])
+        self.assertEqual(events[-2:], [("thinking", "хм"), ("text", "готово")])
+        self.assertEqual(bodies[1]["messages"][-1]["role"], "tool")
+
+    def test_falls_back_without_tools(self):
+        rounds = [[{"type": "response.output_text.delta", "delta": "без интернета"}]]
+        events, calls, bodies = self.run_stream("muse-spark-1.3-contributor-free", rounds,
+                                                reject_tools=True)
+        self.assertEqual(events, [("text", "без интернета")])
+        self.assertNotIn("tools", bodies[-1])
+        self.assertIn("muse-spark-1.3-contributor-free", llm.no_tools)
+
+    def test_images_in_input(self):
         msgs = [{"role": "user", "text": "что тут?",
                  "files": [{"mime": "image/png", "name": "a.png", "data": b"x"}]},
                 {"role": "assistant", "text": "картинка"}]
-        body = llm.responses_body(muse, "sys", msgs, "xhigh")
-        self.assertEqual(body["reasoning"], {"effort": "xhigh", "summary": "auto"})
-        self.assertEqual(body["input"][0]["content"][1]["type"], "input_image")
-        self.assertEqual(body["input"][1]["content"][0]["type"], "output_text")
+        items = llm.responses_input(msgs)
+        self.assertEqual(items[0]["content"][1]["type"], "input_image")
+        self.assertEqual(items[1]["content"][0]["type"], "output_text")
+        chat = llm.chat_messages("sys", msgs)
+        self.assertEqual(chat[1]["content"][1]["type"], "image_url")
 
-    def test_parse_streams(self):
-        delta = '{"type":"response.output_text.delta","delta":"hi"}'
-        self.assertEqual(list(llm.parse_responses(None, delta)), [("text", "hi")])
-        chunk = '{"choices":[{"delta":{"reasoning_content":"хм","content":"да"}}]}'
-        self.assertEqual(list(llm.parse_chat(None, chunk)), [("thinking", "хм"), ("text", "да")])
-        with self.assertRaises(llm.LLMError):
-            list(llm.parse_responses(None, '{"type":"error","error":{"message":"плохо"}}'))
+    def test_human_errors(self):
+        self.assertIn("ключ", llm.human_error(llm.LLMError("bad", 401)))
+        self.assertIn("перегружена", llm.human_error(llm.LLMError("slow", 429)))
 
 
 class TestStore(unittest.TestCase):

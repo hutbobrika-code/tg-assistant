@@ -77,6 +77,22 @@ def fix_text(text):
     return "".join(out)
 
 
+WEB_IMAGE = re.compile(r"!\[[^\]]*\]\((https?://[^)\s]+)[^)]*\)")
+
+
+def web_images(md):
+    return list(dict.fromkeys(WEB_IMAGE.findall(md)))
+
+
+def drop_images(md, urls=None):
+    # убирает картинки по ссылкам (все, если urls не задан) и опустевшие коллажи
+    def keep(m):
+        return "" if urls is None or m.group(1) in urls else m.group(0)
+    md = WEB_IMAGE.sub(keep, md)
+    md = re.sub(r"<tg-(collage|slideshow)>\s*</tg-\1>", "", md)
+    return re.sub(r"\n{3,}", "\n\n", md).strip()
+
+
 def without_followups(text):
     # ответ без блока с подсказками, в таком виде он идёт в историю
     return "\n".join(f"```{lang}\n{body}\n```" if kind != "text" else body
