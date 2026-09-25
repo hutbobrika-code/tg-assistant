@@ -20,9 +20,9 @@ jobs:
   shift:
     runs-on: ubuntu-latest
     timeout-minutes: 340
-    # без токена бота смену не запускаем, иначе cron будет крутить её вхолостую
+    # без токена бота и ключа opencode смену не запускаем, иначе cron будет крутить её вхолостую
     env:
-      ENABLED: ${{ secrets.TG_TOKEN != '' }}
+      ENABLED: ${{ secrets.TG_TOKEN != '' && secrets.OPENCODE_API_KEY != '' }}
     steps:
       - uses: actions/checkout@v4
         if: env.ENABLED == 'true'
@@ -33,13 +33,15 @@ jobs:
 
       - name: Смена
         if: env.ENABLED == 'true'
+        run: |
+          echo "STARTED=$(date +%s)" >> "$GITHUB_ENV"
+          python3 bot.py
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           STATE_KEY: ${{ secrets.STATE_KEY }}
           SHIFT_MINUTES: "300"
-        run: python3 bot.py
 
       - name: Сохранить историю
         if: always() && env.ENABLED == 'true'
@@ -52,8 +54,15 @@ jobs:
           git pull --rebase --autostash
           git push
 
+      # если смена упала сразу, сами её не перезапускаем, иначе будет бесконечный круг.
+      # такую подхватит cron через час
       - name: Следующая смена
         if: always() && env.ENABLED == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run bot.yml --ref main
+        run: |
+          if [ $(( $(date +%s) - ${STARTED:-0} )) -lt 600 ]; then
+            echo "смена продержалась меньше 10 минут, жду cron"
+            exit 0
+          fi
+          gh workflow run bot.yml --ref main
