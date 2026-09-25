@@ -1,0 +1,14 @@
+name: Тесты
+
+on:
+  push:
+    paths: ["**.py", "prompt.md"]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: command -v rsvg-convert || (sudo apt-get update -qq && sudo apt-get install -y -qq librsvg2-bin)
+      - run: python3 -m unittest -v

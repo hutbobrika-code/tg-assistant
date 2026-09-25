@@ -1,0 +1,59 @@
+name: Бот
+
+# job в actions живёт максимум 6 часов, поэтому смена 5 часов, потом сохраняем
+# историю и запускаем следующую. cron на случай если цепочка оборвётся
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: assistant-bot
+  cancel-in-progress: false
+
+jobs:
+  shift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    # без токена бота смену не запускаем, иначе cron будет крутить её вхолостую
+    env:
+      ENABLED: ${{ secrets.TG_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.ENABLED == 'true'
+
+      - name: rsvg-convert для схем
+        if: env.ENABLED == 'true'
+        run: command -v rsvg-convert || (sudo apt-get update -qq && sudo apt-get install -y -qq librsvg2-bin)
+
+      - name: Смена
+        if: env.ENABLED == 'true'
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+          SHIFT_MINUTES: "300"
+        run: python3 bot.py
+
+      - name: Сохранить историю
+        if: always() && env.ENABLED == 'true'
+        run: |
+          git config user.name "assistant-bot"
+          git config user.email "assistant-bot@users.noreply.github.com"
+          git add state
+          git diff --staged --quiet && exit 0
+          git commit -m "история $(date -u '+%F %H:%M UTC')"
+          git pull --rebase --autostash
+          git push
+
+      - name: Следующая смена
+        if: always() && env.ENABLED == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run bot.yml --ref main
