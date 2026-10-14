@@ -38,17 +38,15 @@ Muse Spark 1.3 бесплатна в обмен на то, что Meta може�
 ## Настройка
 
 1. Бот у @BotFather, его токен
-2. Ключ OpenCode Zen: https://opencode.ai/auth
-3. Секреты в Settings -> Secrets and variables -> Actions:
+2. Секреты в Settings -> Secrets and variables -> Actions:
 
 | | |
 |---|---|
 | `TG_TOKEN` | токен бота |
-| `ALLOWED_USERS` | telegram id через запятую, остальным бот не отвечает (свой id бот напишет, если написать ему) |
-| `OPENCODE_API_KEY` | ключ OpenCode Zen |
-| `STATE_KEY` | любая длинная строка, ей шифруется история. без неё история живёт до конца смены |
+| `ALLOWED_USERS` | telegram id через запятую (по умолчанию разрешён владелец) |
+| `STATE_KEY` | любая длинная строка, ей шифруется история |
 
-4. Actions -> Бот -> Run workflow
+3. Actions -> Бот -> Run workflow
 
 Смена длится 5 часов, потом история шифруется, коммитится в `state/` и
 запускается следующая смена. Репо публичный (так минуты Actions бесплатные),

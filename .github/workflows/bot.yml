@@ -20,16 +20,52 @@ jobs:
   shift:
     runs-on: ubuntu-latest
     timeout-minutes: 340
-    # без токена бота и ключа opencode смену не запускаем, иначе cron будет крутить её вхолостую
     env:
-      ENABLED: ${{ secrets.TG_TOKEN != '' && secrets.OPENCODE_API_KEY != '' }}
+      ENABLED: ${{ secrets.TG_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
         if: env.ENABLED == 'true'
 
-      - name: rsvg-convert для схем
+      - name: Установка Python
         if: env.ENABLED == 'true'
-        run: command -v rsvg-convert || (sudo apt-get update -qq && sudo apt-get install -y -qq librsvg2-bin)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Утилиты для схем
+        if: env.ENABLED == 'true'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq librsvg2-bin
+
+      - name: Установка OpenCode
+        if: env.ENABLED == 'true'
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> $GITHUB_PATH
+
+      - name: Конфигурация OpenCode
+        if: env.ENABLED == 'true'
+        run: |
+          mkdir -p ~/.config/opencode
+          cp deploy/opencode.json ~/.config/opencode/
+          cp deploy/AGENTS.md ~/.config/opencode/
+          mkdir -p workspace
+          cp deploy/AGENTS.md workspace/
+
+      - name: Расшифровка состояния
+        if: env.ENABLED == 'true'
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          if [ -n "$STATE_KEY" ] && [ -f state/state.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -salt -pass env:STATE_KEY -in state/state.enc -out state.json || true
+          fi
+
+      - name: Запуск сервера OpenCode
+        if: env.ENABLED == 'true'
+        run: |
+          $HOME/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4096 &
+          timeout 60 bash -c 'until curl -s http://127.0.0.1:4096/ >/dev/null; do sleep 1; done'
+          echo "OpenCode server ready!"
 
       - name: Смена
         if: env.ENABLED == 'true'
@@ -39,23 +75,24 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          STATE_KEY: ${{ secrets.STATE_KEY }}
+          ALLOWED_IDS: "8693081862"
           SHIFT_MINUTES: "300"
+          OC_WORKDIR: "workspace"
 
       - name: Сохранить историю
         if: always() && env.ENABLED == 'true'
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
         run: |
-          git config user.name "assistant-bot"
-          git config user.email "assistant-bot@users.noreply.github.com"
-          git add state
-          git diff --staged --quiet && exit 0
-          git commit -m "история $(date -u '+%F %H:%M UTC')"
-          git pull --rebase --autostash
-          git push
+          if [ -f state.json ] && [ -n "$STATE_KEY" ]; then
+            mkdir -p state
+            openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt -pass env:STATE_KEY -in state.json -out state/state.enc
+            git config user.name "assistant-bot"
+            git config user.email "assistant-bot@users.noreply.github.com"
+            git add state/state.enc
+            git diff --staged --quiet || (git commit -m "история $(date -u '+%F %H:%M UTC')" && git pull --rebase && git push)
+          fi
 
-      # если смена упала сразу, сами её не перезапускаем, иначе будет бесконечный круг.
-      # такую подхватит cron через час
       - name: Следующая смена
         if: always() && env.ENABLED == 'true'
         env:

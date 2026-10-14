@@ -1,343 +1,2126 @@
-# Телеграм-бот с моделями OpenCode Zen (по умолчанию Muse Spark 1.3 на xhigh).
-# Крутится сменами в GitHub Actions, как gemini-check: смена 5 часов, потом следующая.
-#
-#   python3 bot.py
+#!/usr/bin/env python3
+"""Telegram bot on top of an OpenCode server.
 
-import queue
-import sys
+Each message goes to an OpenCode session. While the agent works, the chat
+shows a live progress message (status, steps, streamed text) that is edited
+in place; the result is posted as a rich message with formulas and tables
+rendered by Telegram and the steps folded into a <details> block.
+"""
+import html
+import itertools
+import json
+import mimetypes
+import os
+import re
 import threading
 import time
+import traceback
+from collections import OrderedDict
+from pathlib import Path
+from queue import Empty, Queue
+from urllib.parse import urlparse
 
-from assistant import log, models
-from assistant.chat import Responder
-from assistant.config import settings
-from assistant.markdown import plain
-from assistant.store import Store
-from assistant.telegram import Telegram, TelegramError
+from cc import ClaudeCode
+from oc import OpenCode, OpenCodeError
+from render import RICH_LIMIT, md_escape, md_to_html, prepare, split_long
+from tg import Telegram, log
 
-TEXT_FILES = (".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".yml", ".yaml", ".html",
-              ".css", ".xml", ".log", ".ini", ".toml", ".sql", ".sh", ".java", ".c", ".cpp",
-              ".h", ".go", ".rs", ".kt", ".swift", ".php", ".rb")
-TEXT_LIMIT = 300_000
-FILE_LIMIT = 15_000_000
-GATHER = 1.5  # сколько ждём, не допишет ли человек ещё сообщение (длинный текст, альбом)
+BASE = Path(__file__).resolve().parent
 
-COMMANDS = [
-    {"command": "new", "description": "🧹 Новый диалог"},
-    {"command": "model", "description": "🧠 Модель, режим, интернет"},
-    {"command": "help", "description": "❔ Что я умею"},
+
+def load_env(path):
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+load_env(BASE / ".env")
+
+TOKEN = os.environ.get("TG_TOKEN", "")
+ALLOWED = {int(x) for x in re.split(r"[,\s]+", os.environ.get("ALLOWED_IDS") or os.environ.get("ALLOWED_USERS", "")) if x}
+OC_URL = os.environ.get("OC_URL", "http://127.0.0.1:4096")
+OC_PASSWORD = os.environ.get("OPENCODE_SERVER_PASSWORD", "")
+CLAUDE_BIN = os.path.expanduser(os.environ.get("CLAUDE_BIN", "~/.local/bin/claude"))
+CLAUDE_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+DEFAULT_MODEL = os.environ.get("OC_MODEL", "opencode/muse-spark-1.3-contributor-free")
+DEFAULT_EFFORT = os.environ.get("OC_EFFORT", "xhigh")
+WORKDIR = Path(os.path.expanduser(os.environ.get("OC_WORKDIR", str(BASE / "workspace")))).resolve()
+UPLOADS = WORKDIR / "uploads"
+TIMEOUT = int(os.environ.get("OC_TIMEOUT", "1800"))
+STATE_FILE = BASE / "state.json"
+
+tg = Telegram(TOKEN)
+oc = OpenCode(OC_URL, OC_PASSWORD, WORKDIR)
+claude = ClaudeCode(CLAUDE_BIN, WORKDIR, CLAUDE_TOKEN)
+
+EFFORTS = {  # label, hint
+    "minimal": ("Минимум", "мгновенно"),
+    "low": ("Низкий", "быстро, для простого"),
+    "medium": ("Средний", "баланс скорости и качества"),
+    "high": ("Высокий", "вдумчиво, для сложного"),
+    "xhigh": ("Очень высокий", "глубоко: код и анализ"),
+    "max": ("Максимум", "предельно тщательно, дольше всего"),
+}
+CLAUDE_ICON, OPENCODE_ICON = "✴️", "🔹"
+CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+CLAUDE_MODELS = [
+    {"id": "claude/claude-opus-5-5", "name": "Claude Opus 5.5", "short": "Opus 5.5",
+     "variants": CLAUDE_EFFORTS, "context": 1_000_000},
+    {"id": "claude/claude-opus-5", "name": "Claude Opus 5", "short": "Opus 5",
+     "variants": CLAUDE_EFFORTS, "context": 1_000_000},
+    {"id": "claude/claude-fable-5-1", "name": "Claude Fable 5.1", "short": "Fable 5.1",
+     "variants": CLAUDE_EFFORTS, "context": 1_000_000},
+    {"id": "claude/claude-sonnet-5", "name": "Claude Sonnet 5", "short": "Sonnet 5",
+     "variants": CLAUDE_EFFORTS, "context": 1_000_000},
+    {"id": "claude/claude-haiku-4-5", "name": "Claude Haiku 4.5", "short": "Haiku 4.5",
+     "variants": [], "context": 200_000},
+]
+DEFAULT_CLAUDE_MODEL = CLAUDE_MODELS[0]["id"]
+CLAUDE_LIMITS = {}  # latest rate_limit_info from Claude Code
+
+# Telegram's AIActions set (made for AI bots). Custom emoji only render when the bot
+# owner has Telegram Premium, so they are switched on by `is_premium` of the owner.
+PREMIUM_ICONS = {
+    "💭": "5535034915403333642", "🧠": "5535457114983497745", "🌐": "5535365052359507996",
+    "🔎": "5535248817659576336", "📖": "5535039193190760468", "📝": "5537203062138994712",
+    "✏️": "5535287489545109527", "💻": "5535251334510411788", "🤖": "5537515087218081814",
+    "⚙️": "5537515087218081814", "🔧": "5537560399123054610", "✨": "5573389291184193551",
+    "🖼": "5537651753077440526", "✍️": "5573451671289200650",
+}
+PREMIUM_RE = re.compile("|".join(re.escape(k) for k in sorted(PREMIUM_ICONS, key=len, reverse=True)))
+TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>')
+PREMIUM = {"on": False, "broken": 0}  # broken: when Telegram last stripped them (retried after PREMIUM_RETRY)
+PREMIUM_RETRY = 6 * 3600
+SKIP_DIRS = {"uploads", "node_modules", "__pycache__", "venv", ".venv", ".git"}
+THINK_SHOWN = 4  # reasoning shorter than this (seconds) is not listed as a step
+WALK_LIMIT = 20000
+TEXT_EXT = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".tsv", ".yaml", ".yml", ".toml", ".ini",
+            ".html", ".css", ".xml", ".sql", ".sh", ".c", ".h", ".cpp", ".hpp", ".java", ".kt", ".go",
+            ".rs", ".rb", ".php", ".swift", ".cs", ".lua", ".log", ".tex", ".jsx", ".tsx", ".vue"}
+MEDIA_KEYS = ("photo", "document", "voice", "audio", "video", "video_note", "animation")
+BURST_WINDOW = 2.5  # склейка фото/файлов без media_group_id, пришедших пачкой, в один запрос
+CAPTION_WAIT = 90  # фото без текста ждут подпись с заданием, а не уходят в модель сразу
+
+EXAMPLES = [
+    ("🧮 Формула", "Выведи формулу корней квадратного уравнения и коротко объясни каждый шаг"),
+    ("📊 Таблица", "Сравни Python, Go и Rust таблицей: скорость, порог входа, где применяются"),
+    ("📈 График", "Построй графики sin(x) и cos(x) на отрезке от −2π до 2π и пришли картинку"),
 ]
 
-EFFORT_HINTS = {
-    "minimal": "почти без размышлений, самый быстрый",
-    "low": "быстрые ответы на простые вопросы",
-    "medium": "баланс скорости и качества",
-    "high": "думает дольше, для сложных задач",
-    "xhigh": "максимум размышлений, самые точные ответы",
-    "max": "предельная глубина, может думать минутами",
-}
 
-HELP = """<b>Привет{name}! Я ассистент на {model}</b>
+# ---------- small helpers ----------
 
-Пиши вопрос или присылай фото, скриншоты, PDF и текстовые файлы — я их читаю. \
-Если на картинке мелкий текст, пришли её файлом, без сжатия.
-
-Отвечаю с таблицами, формулами и схемами, могу поискать в интернете. \
-Пока думаю, видно, что именно делаю, а если долго — жми «стоп».
-
-/model — модель, режим размышлений, интернет
-/new — новый диалог, я забуду предыдущий
-
-Под ответом кнопки: 💬 продолжить разговор, 🔄 переписать ответ.
-
-<i>Muse Spark бесплатна, потому что Meta может учить модели на переписке. \
-Совсем личное лучше не присылать.</i>"""
+def plural(n, one, few, many):
+    n = abs(n) % 100
+    if 10 < n < 20:
+        return many
+    n %= 10
+    return one if n == 1 else few if 2 <= n <= 4 else many
 
 
-class Bot:
-    def __init__(self, tg):
-        self.tg = tg
-        self.store = Store()
-        self.responder = Responder(tg, self.store)
-        self.queues = {}
-        self.inbox = {}  # chat -> сообщения, которые ещё собираем в один вопрос
-        self.saved_offset = self.store.offset
-        self.saved_at = time.monotonic()
+def fmt_dur(sec):
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec} с"
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f"{m} мин {s} с" if s else f"{m} мин"
+    h, m = divmod(m, 60)
+    return f"{h} ч {m} мин"
 
-    def run(self, minutes):
-        try:
-            self.tg.call("setMyCommands", commands=COMMANDS)
-        except TelegramError as e:
-            log(e)
-        log(f"смена на {minutes} мин")
-        end = time.monotonic() + minutes * 60
-        while time.monotonic() < end:
-            self.flush_inbox()
-            self.poll(1 if self.inbox else 50)
-            self.save_offset()
-        self.finish()
 
-    def poll(self, wait):
-        try:
-            updates = self.tg.updates(self.store.offset, wait)
-        except TelegramError as e:
-            log(e)
-            time.sleep(5)
-            return
-        for u in updates:
-            self.store.offset = u["update_id"] + 1
+def fmt_num(n):
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}".rstrip("0").rstrip(".") + " млн"
+    if n >= 1000:
+        return f"{n / 1000:.1f}".rstrip("0").rstrip(".") + " тыс."
+    return str(n)
+
+
+def fmt_size(n):
+    for unit in ("Б", "КБ", "МБ"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "Б" else f"{n:.1f}".rstrip("0").rstrip(".") + f" {unit}"
+        n /= 1024
+    return f"{n:.1f}".rstrip("0").rstrip(".") + " ГБ"
+
+
+def ago(ts):
+    d = time.time() - ts
+    if d < 60:
+        return "только что"
+    if d < 3600:
+        return f"{int(d // 60)} мин назад"
+    if d < 86400:
+        return f"{int(d // 3600)} ч назад"
+    if d < 172800:
+        return "вчера"
+    return time.strftime("%d.%m", time.localtime(ts))
+
+
+def short(s, n=90):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def rel(p):
+    try:
+        return str(Path(p).resolve().relative_to(WORKDIR)) or "."
+    except (ValueError, OSError):
+        return str(p)
+
+
+def code(s, n=70):
+    return "`" + short(s, n).replace("`", "ˋ") + "`"
+
+
+def btn(text, data, style=None):
+    b = {"text": text, "callback_data": data}
+    if style:
+        b["style"] = style
+    return b
+
+
+def tg_async(method, **params):
+    """Fire-and-forget call for cosmetic updates: Telegram sometimes holds a request for ~30 s."""
+    threading.Thread(target=tg, args=(method,), kwargs=dict(params, _retries=1), daemon=True).start()
+
+
+class Reactions:
+    """Sets reactions from a background thread, in order; only the latest wish per message is sent."""
+
+    def __init__(self, chat_id):
+        self.chat_id = chat_id
+        self.want = OrderedDict()
+        self.busy = False
+        self.cv = threading.Condition()
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def set(self, msg_id, emoji):
+        with self.cv:
+            self.want[msg_id] = emoji
+            self.want.move_to_end(msg_id)
+            self.cv.notify()
+
+    def pending(self):
+        with self.cv:
+            return bool(self.want) or self.busy
+
+    def loop(self):
+        while True:
+            with self.cv:
+                self.cv.wait_for(lambda: self.want)
+                msg_id, emoji = self.want.popitem(last=False)
+                self.busy = True
             try:
-                self.on_update(u)
-            except Exception as e:
-                log(f"апдейт {u['update_id']}: {e!r}")
+                tg("setMessageReaction", _timeout=40, _retries=1, chat_id=self.chat_id, message_id=msg_id,
+                   reaction=[{"type": "emoji", "emoji": emoji}] if emoji else [])
+            finally:
+                with self.cv:
+                    self.busy = False
 
-    def save_offset(self):
-        # если смена упадёт, следующая не должна отвечать на те же сообщения второй раз
-        if self.store.offset != self.saved_offset and time.monotonic() - self.saved_at > 30:
-            self.store.save()
-            self.saved_offset, self.saved_at = self.store.offset, time.monotonic()
 
-    def finish(self):
-        # даём дописать начатые ответы, потом сохраняемся
-        self.flush_inbox(force=True)
-        deadline = time.monotonic() + 25 * 60
-        while any(q.unfinished_tasks for q in self.queues.values()) and time.monotonic() < deadline:
-            time.sleep(1)
-        self.store.save()
-        log("смена закончилась")
+REACTIONS = {}
+REACTIONS_LOCK = threading.Lock()
 
-    def on_update(self, u):
-        if "message" in u:
-            self.on_message(u["message"])
-        elif "callback_query" in u:
-            self.on_button(u["callback_query"])
-        elif "stopped_message_generation" in u:
-            self.responder.stop(u["stopped_message_generation"]["draft_id"])
 
-    def allowed(self, user, chat):
-        if str(user.get("id")) in settings.allowed:
-            return True
-        self.tg.send(chat, f"🔒 Это личный бот.\nТвой id: <code>{user.get('id')}</code>")
+def react(chat_id, msg_id, emoji=None):
+    if not msg_id:
+        return
+    with REACTIONS_LOCK:
+        r = REACTIONS.get(chat_id) or REACTIONS.setdefault(chat_id, Reactions(chat_id))
+    r.set(msg_id, emoji)
+
+
+def reactions_pending():
+    with REACTIONS_LOCK:
+        return any(r.pending() for r in REACTIONS.values())
+
+
+def walk_files(skip=SKIP_DIRS):
+    """(mtime, size, path) for files in the workspace, skipping hidden and bulky dirs."""
+    seen = 0
+    for root, dirs, names in os.walk(WORKDIR):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in skip]
+        for n in names:
+            seen += 1
+            if seen > WALK_LIMIT:
+                return
+            if n.startswith("."):
+                continue
+            p = Path(root) / n
+            try:
+                s = p.stat()
+            except OSError:
+                continue
+            yield s.st_mtime, s.st_size, p
+
+
+# ---------- persistent state ----------
+
+state_lock = threading.Lock()
+try:
+    STATE = json.loads(STATE_FILE.read_text())
+except (OSError, ValueError):
+    STATE = {}
+
+
+def chat_state(chat_id):
+    with state_lock:
+        st = STATE.setdefault(str(chat_id), {})
+        st.setdefault("model", DEFAULT_MODEL)
+        st.setdefault("effort", DEFAULT_EFFORT)
+        st.setdefault("agent", "build")
+        st.setdefault("session", None)
+        return st
+
+
+def save_state():
+    with state_lock:
+        data = json.dumps(STATE, indent=1, ensure_ascii=False)
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(data)
+        tmp.replace(STATE_FILE)
+
+
+_models = {"at": 0, "list": []}
+
+
+def models():
+    """Claude models (when connected) first, then the free OpenCode ones."""
+    if time.time() - _models["at"] > 600 or not _models["list"]:
+        try:
+            _models["list"] = oc.models()
+            _models["at"] = time.time()
+        except OpenCodeError as e:
+            log("models:", e)
+    return (CLAUDE_MODELS if claude.available() else []) + _models["list"]
+
+
+def model_info(model_id):
+    return next((m for m in models() + CLAUDE_MODELS if m["id"] == model_id),
+                {"id": model_id, "name": model_id.split("/")[-1], "variants": [], "context": None})
+
+
+def engine_of(model_id):
+    return "claude" if model_id.startswith("claude/") else "opencode"
+
+
+def engine_icon(model_id):
+    return CLAUDE_ICON if engine_of(model_id) == "claude" else OPENCODE_ICON
+
+
+def short_name(m):
+    return m.get("short") or re.sub(r"\s+Free$", "", m["name"])
+
+
+def effort_label(v):
+    return EFFORTS.get(v, (v, ""))[0]
+
+
+def meter(m, v):
+    """▰▰▰▱▱ - how deep this level is among the model's levels."""
+    levels = m["variants"]
+    filled = max(1, round((levels.index(v) + 1) / len(levels) * 5)) if v in levels else 0
+    return "▰" * filled + "▱" * (5 - filled)
+
+
+def effort_for(st, model_id=None):
+    """Reasoning level for a model: the one picked for it, else xhigh, else the deepest it has."""
+    model_id = model_id or st["model"]
+    variants = model_info(model_id)["variants"]
+    if not variants:
+        return None
+    for v in ((st.get("efforts") or {}).get(model_id), st.get("effort")):
+        if v in variants:
+            return v
+    return "xhigh" if "xhigh" in variants else variants[-1]
+
+
+def premiumize(md):
+    """Swap plain icons in bot-authored text for animated custom emoji when they can render."""
+    if not PREMIUM["on"] or time.time() - PREMIUM["broken"] < PREMIUM_RETRY:
+        return md
+    return PREMIUM_RE.sub(lambda m: f'<tg-emoji emoji-id="{PREMIUM_ICONS[m.group(0)]}">{m.group(0)}</tg-emoji>', md)
+
+
+def plain_icons(md):
+    return TG_EMOJI_RE.sub(r"\1", md)
+
+
+def premium_kept(result):
+    """False if Telegram stripped our custom emoji (then they show as the pack's generic smiley)."""
+    return "custom_emoji" in json.dumps(result or {})
+
+
+FILE_TOKENS = OrderedDict()
+_file_seq = itertools.count(1)
+
+
+def file_token(path):
+    key = str(path)
+    for k, v in FILE_TOKENS.items():
+        if v == key:
+            return k
+    k = str(next(_file_seq))
+    FILE_TOKENS[k] = key
+    while len(FILE_TOKENS) > 500:
+        FILE_TOKENS.popitem(last=False)
+    return k
+
+
+# ---------- describing agent steps ----------
+
+def tool_info(part):
+    """(icon, text, literal) for a tool part."""
+    name = part.get("tool", "")
+    st = part.get("state") or {}
+    inp = st.get("input") or {}
+    path = inp.get("filePath") or inp.get("path") or ""
+    if name == "bash":
+        if inp.get("description"):
+            return "💻", inp["description"], None
+        return "💻", "Выполняю", inp.get("command") or "команду"
+    if name == "read":
+        return "📖", "Читаю", rel(path)
+    if name == "write":
+        return "📝", "Создаю", rel(path)
+    if name in ("edit", "multiedit", "patch", "apply_patch"):
+        return "✏️", "Правлю", rel(path) if path else "файлы"
+    if name == "glob":
+        return "🔎", "Ищу файлы", inp.get("pattern", "")
+    if name == "grep":
+        return "🔎", "Ищу в коде", inp.get("pattern", "")
+    if name == "list":
+        return "📂", "Смотрю папку", rel(path) if path else "."
+    if name == "webfetch":
+        return "🌐", "Открываю", urlparse(inp.get("url", "")).netloc or inp.get("url", "")
+    if name == "websearch":
+        return "🌐", f"Ищу в интернете «{short(inp.get('query', ''), 60)}»", None
+    if name == "todowrite":
+        return "📋", "Обновляю план", None
+    if name == "todoread":
+        return "📋", "Сверяюсь с планом", None
+    if name == "task":
+        return "🤖", "Подзадача: " + short(inp.get("description", ""), 60), None
+    if name == "question":
+        return "❓", "Задаю вопрос", None
+    if name == "skill":
+        return "🧩", "Навык", inp.get("name", "")
+    return "🔧", name, None
+
+
+def tool_md(part):
+    icon, text, lit = tool_info(part)
+    s = f"{icon} {md_escape(short(text, 80))}".rstrip()
+    if lit:
+        s += " " + code(lit)
+    if (part.get("state") or {}).get("status") == "error":
+        s += " — ❌ ошибка"
+    return s
+
+
+def plan_md(todos):
+    lines = []
+    for t in todos:
+        c = md_escape(short(t.get("content", ""), 110))
+        s = t.get("status")
+        if s == "completed":
+            lines.append(f"- [x] {c}")
+        elif s == "cancelled":
+            lines.append(f"- [x] ~~{c}~~")
+        elif s == "in_progress":
+            lines.append(f"- [ ] **{c}** ⏳")
+        else:
+            lines.append(f"- [ ] {c}")
+    return "\n".join(lines)
+
+
+def step_md(step):
+    kind, val = step
+    if kind == "tool":
+        return "- " + tool_md(val)
+    if kind == "think":
+        return f"- 🧠 Думал {fmt_dur(val)}"
+    return "- 💭 _" + md_escape(short(val, 180)) + "_"
+
+
+def step_html(step):
+    """One line of the live steps quote (inside an HTML block, so no markdown)."""
+    kind, val = step
+    if kind == "think":
+        return f"🧠 Думал {fmt_dur(val)}"
+    if kind == "narr":
+        return "💭 <i>" + html.escape(short(val, 140)) + "</i>"
+    icon, text, lit = tool_info(val)
+    s = f"{icon} {html.escape(short(text, 70))}" if text else icon
+    if lit:
+        s += " <code>" + html.escape(short(lit, 60)) + "</code>"
+    status = (val.get("state") or {}).get("status")
+    if status == "error":
+        s += " ❌"
+    elif status in ("pending", "running"):
+        s += " …"
+    return s
+
+
+def steps_quote(steps, limit=6):
+    """Latest steps first, in an expandable quote."""
+    lines = [step_html(s) for s in reversed(steps[-limit:])]
+    if len(steps) > limit:
+        lines.append(f"… и ещё {len(steps) - limit}")
+    return "<blockquote expandable>" + "<br>".join(lines) + "</blockquote>"
+
+
+def reasoning_seconds(part):
+    t = part.get("time") or {}
+    return (t["end"] - t["start"]) / 1000 if t.get("start") and t.get("end") else 0
+
+
+def analyze(parts):
+    """Split assistant parts into steps (tools + narration before them), the trailing answer and the plan."""
+    steps, answer, todos = [], [], None
+    for p in parts:
+        t = p.get("type")
+        if t == "reasoning" and reasoning_seconds(p) >= THINK_SHOWN:
+            steps.append(("think", reasoning_seconds(p)))
+        elif t == "tool":
+            steps += [("narr", x) for x in answer]
+            answer = []
+            if p.get("tool") == "todowrite":
+                todos = ((p.get("state") or {}).get("input") or {}).get("todos") or todos
+            steps.append(("tool", p))
+        elif t == "text" and not p.get("synthetic") and not p.get("ignored"):
+            if (p.get("text") or "").strip():
+                answer.append(p["text"])
+    return steps, "\n\n".join(answer).strip(), todos
+
+
+def activity_md(parts):
+    """Bold status line for what the agent is doing right now."""
+    last = parts[-1] if parts else None
+    if last and last["type"] == "tool" and (last.get("state") or {}).get("status") in ("pending", "running"):
+        icon, text, lit = tool_info(last)
+        s = f"{icon} **{md_escape(short(text, 60))}**" if text else icon
+        return s + (" " + code(lit, 50) if lit else "")
+    if last and last["type"] == "reasoning" and not (last.get("time") or {}).get("end"):
+        return "💭 **Размышляю**"
+    if last and last["type"] == "text" and not (last.get("time") or {}).get("end"):
+        return "✍️ **Пишу ответ**"
+    return "💭 **Думаю**"
+
+
+def steps_block(steps, todos, title, open_=False, limit=80):
+    lines = []
+    if todos:
+        lines += ["**📋 План**", "", plan_md(todos), ""]
+    shown = steps[-limit:]
+    if len(steps) > limit:
+        lines.append(f"- … и ещё {len(steps) - limit}")
+    lines += [step_md(s) for s in shown]
+    return f"<details{' open' if open_ else ''}><summary>{title}</summary>\n\n" + "\n".join(lines) + "\n\n</details>"
+
+
+def steps_title(n, seconds):
+    return f"⚙️ {n} {plural(n, 'шаг', 'шага', 'шагов')} · {fmt_dur(seconds)}"
+
+
+def error_text(err):
+    if not err:
+        return None
+    if isinstance(err, str):
+        return err
+    data = err.get("data") or {}
+    return data.get("message") or err.get("message") or err.get("name") or "неизвестная ошибка"
+
+
+# ---------- sending rich messages ----------
+
+def input_media(media):
+    return [{"id": mid, "media": {"type": kind, "media": f"attach://{mid}"}} for mid, kind, _ in media]
+
+
+def send_rich(chat, md, media=(), reply_to=None, markup=None, plain=None):
+    """Send one rich message; retries media as documents, then falls back to HTML text."""
+    params = dict(chat_id=chat.id, reply_markup=markup,
+                  reply_parameters={"message_id": reply_to, "allow_sending_without_reply": True} if reply_to else None)
+    rm = {"markdown": md.strip() or "…"}
+    if media:
+        rm["media"] = input_media(media)
+        r = tg.upload("sendRichMessage", {mid: p for mid, _, p in media}, rich_message=rm, **params)
+        if not r.get("ok") and any(k != "document" for _, k, _ in media):
+            log("sendRichMessage with media failed:", r.get("description"), "- retrying as documents")
+            media = [(mid, "document", p) for mid, _, p in media]
+            md = re.sub(r"tg://(photo|video|audio)\?id=", "tg://document?id=", md)
+            rm = {"markdown": md.strip(), "media": input_media(media)}
+            r = tg.upload("sendRichMessage", {mid: p for mid, _, p in media}, rich_message=rm, **params)
+    else:
+        r = tg("sendRichMessage", rich_message=rm, **params)
+    if r.get("ok"):
+        mid = r["result"]["message_id"]
+        chat.last_seen = max(chat.last_seen, mid)
+        if not check_premium(md, r["result"]) and not media:
+            tg("editMessageText", chat_id=chat.id, message_id=mid, reply_markup=markup,
+               rich_message=dict(rm, markdown=plain_icons(rm["markdown"])))
+        return mid
+    log("sendRichMessage failed:", r.get("description"))
+    return send_fallback(chat, plain if plain is not None else md, media, reply_to, markup)
+
+
+def send_fallback(chat, text, media, reply_to, markup):
+    mid = None
+    chunks = split_long(text or "…", 3800)
+    for i, chunk in enumerate(chunks):
+        params = dict(chat_id=chat.id, link_preview_options={"is_disabled": True},
+                      reply_markup=markup if i == len(chunks) - 1 and not media else None,
+                      reply_parameters={"message_id": reply_to, "allow_sending_without_reply": True}
+                      if reply_to and i == 0 else None)
+        r = tg("sendMessage", text=md_to_html(chunk), parse_mode="HTML", **params)
+        if not r.get("ok"):
+            r = tg("sendMessage", text=chunk, **params)
+        if r.get("ok"):
+            mid = r["result"]["message_id"]
+        else:
+            log("sendMessage failed:", r.get("description"))
+    for j, (_, kind, path) in enumerate(media):
+        method, field = ("sendPhoto", "photo") if kind == "photo" else ("sendDocument", "document")
+        r = tg.upload(method, {field: path}, chat_id=chat.id,
+                      reply_markup=markup if j == len(media) - 1 else None)
+        if r.get("ok"):
+            mid = r["result"]["message_id"]
+    if mid:
+        chat.last_seen = max(chat.last_seen, mid)
+    return mid
+
+
+def send_md(chat, md, markup=None, reply_to=None):
+    """Bot-authored rich text (already escaped)."""
+    return send_rich(chat, premiumize(md), reply_to=reply_to, markup=markup, plain=md)
+
+
+def check_premium(md, result):
+    """After sending custom emoji: if Telegram stripped them, stop using them. Returns False then."""
+    if "<tg-emoji" not in md or premium_kept(result):
+        return True
+    log("custom emoji are not available to this bot; plain emoji for the next 6 h")
+    PREMIUM["broken"] = time.time()
+    return False
+
+
+def edit_md(chat, msg_id, md, markup=None):
+    md = premiumize(md)
+    r = tg("editMessageText", chat_id=chat.id, message_id=msg_id, rich_message={"markdown": md},
+           reply_markup=markup or {"inline_keyboard": []})
+    if r.get("ok") and not check_premium(md, r.get("result")):
+        r = tg("editMessageText", chat_id=chat.id, message_id=msg_id, rich_message={"markdown": plain_icons(md)},
+               reply_markup=markup or {"inline_keyboard": []})
+    if not r.get("ok") and "not modified" not in r.get("description", ""):
+        log("editMessageText:", r.get("description"))
+    return r.get("ok")
+
+
+# ---------- a single request to the agent ----------
+
+RUNS = {}
+RUNS_LOCK = threading.Lock()
+
+
+SPINNER = ("◐", "◓", "◑", "◒")
+STOP_KB = {"inline_keyboard": [[{"text": "⏹ Остановить", "callback_data": "stop"}]]}
+
+
+class LiveMessage:
+    """Progress message that is edited while the agent works and removed once the answer is posted.
+
+    Telegram drafts (sendRichMessageDraft) were tried first, but Telegram sometimes
+    holds a draft request for 30-45 s and then shows it after the final answer as a
+    stale duplicate. An ordinary message can always be deleted.
+    """
+    MIN_GAP = 1.5
+
+    def __init__(self, run):
+        self.run = run
+        self.msg_id = None
+        self.cv = threading.Condition()
+        self.dirty = True
+        self.closed = False
+        self.frame = 0
+        self.last_md = None
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+
+    def poke(self):
+        with self.cv:
+            self.dirty = True
+            self.cv.notify()
+
+    def loop(self):
+        last = 0.0
+        while True:
+            with self.cv:
+                # tick every 2.5 s even without events so the spinner and timer move
+                self.cv.wait_for(lambda: self.dirty or self.closed, timeout=2.5)
+                if self.closed:
+                    return
+                self.dirty = False
+                pause = self.MIN_GAP - (time.time() - last)
+                if pause > 0 and self.cv.wait_for(lambda: self.closed, timeout=pause):
+                    return
+            last = time.time()
+            self.frame += 1
+            md = self.run.live_md(self.frame)
+            if md != self.last_md:
+                self.push(md)
+
+    def push(self, md):
+        chat_id = self.run.chat.id
+        shown = premiumize(md)
+        if self.msg_id is None:
+            r = tg("sendRichMessage", _retries=1, chat_id=chat_id, rich_message={"markdown": shown},
+                   reply_markup=STOP_KB, disable_notification=True)
+            if r.get("ok"):
+                self.msg_id = r["result"]["message_id"]
+                check_premium(shown, r["result"])
+                if self.closed:  # the answer went out while this request was in flight
+                    self.delete()
+        else:
+            r = tg("editMessageText", _retries=1, chat_id=chat_id, message_id=self.msg_id,
+                   rich_message={"markdown": shown}, reply_markup=STOP_KB)
+        desc = r.get("description", "")
+        if r.get("ok") or "not modified" in desc:
+            self.last_md = md
+        elif "not found" in desc:
+            self.msg_id = None
+            self.closed = True  # the user deleted it
+        else:
+            log("live message:", desc)
+
+    def close(self):
+        """Stop updating; the message stays until delete(). Never waits on Telegram."""
+        with self.cv:
+            self.closed = True
+            self.cv.notify()
+
+    def delete(self):
+        mid, self.msg_id = self.msg_id, None
+        if mid:
+            tg_async("deleteMessage", chat_id=self.run.chat.id, message_id=mid)
+
+
+class Run:
+    """One request to an agent. OpenCodeRun and ClaudeRun supply the backend."""
+    engine = ""
+
+    def __init__(self, chat, job):
+        self.chat, self.job = chat, job
+        self.model, self.effort = job["model"], job.get("effort")
+        self.started = time.time()
+        self.done = threading.Event()
+        self.stopped_at = None
+        self.timed_out = False
+        self.error = None
+        self.retry = None
+        self.live = None
+
+    @property
+    def stopped(self):
+        return self.stopped_at is not None
+
+    def waiting_user(self):
+        return self.chat.question is not None or self.chat.permission is not None
+
+    def changed(self):
+        if self.live:
+            self.live.poke()
+
+    # backend hooks
+    def snapshot(self):
+        return []
+
+    def start(self):
+        pass
+
+    def close(self):
+        pass
+
+    def stop(self):
+        if not self.stopped:
+            self.stopped_at = time.time()
+        self.done.set()
+
+    def finished(self, now):
+        """Backend-side check that the run is over (in case an event was missed)."""
         return False
 
-    def on_message(self, msg):
-        chat = msg["chat"]["id"]
-        if msg["chat"].get("type") != "private" or not self.allowed(msg.get("from", {}), chat):
-            return
-        text = msg.get("text") or ""
-        if text.startswith("/"):
-            return self.command(chat, text.split()[0].split("@")[0].lower(), msg.get("from"))
-        if msg.get("voice") or msg.get("video_note") or msg.get("audio"):
-            return self.tg.send(chat, "🎙 Голосовые пока не понимаю, напиши текстом",
-                                reply_to=msg["message_id"])
-        box = self.inbox.setdefault(chat, {"msgs": []})
-        box["msgs"].append(msg)
-        box["at"] = time.monotonic()
+    def settle(self):
+        """After a stop: give the backend a moment to save the partial answer."""
 
-    def flush_inbox(self, force=False):
-        # телега режет длинный текст на несколько сообщений и шлёт альбом по одной
-        # фотке, поэтому всё, что пришло подряд, считаем одним вопросом
-        for chat, box in list(self.inbox.items()):
-            if force or time.monotonic() - box["at"] > GATHER:
-                del self.inbox[chat]
-                self.ask(chat, sorted(box["msgs"], key=lambda m: m["message_id"]))
+    def collect(self):
+        """(parts, error) of the finished run; updates the dialog state."""
+        return self.snapshot(), self.error
 
-    def ask(self, chat, msgs):
-        entry = self.user_entry(msgs)
-        if not entry["text"] and not entry["files"]:
-            return self.tg.send(chat, "Такое пока не понимаю 🙂 Пришли текст, фото или файл.",
-                                reply_to=msgs[-1]["message_id"])
-        entry["msg"] = msgs[-1]["message_id"]
-        user = msgs[-1].get("from")
-        self.enqueue(chat, entry, lambda: self.responder.answer(chat, entry["msg"], user))
+    def regen_info(self):
+        return None
 
-    def user_entry(self, msgs):
-        texts, files = [], []
-        for m in msgs:
-            if m.get("text") or m.get("caption"):
-                texts.append(m.get("text") or m.get("caption"))
-            if m.get("photo"):
-                files.append({"file_id": m["photo"][-1]["file_id"], "mime": "image/jpeg",
-                              "name": "photo.jpg"})
-            doc = m.get("document")
-            if doc:
-                texts.append(self.document(doc, files))
+    # shared behaviour
+    def badge(self):
+        m = model_info(self.model)
+        s = f"{engine_icon(self.model)} {short_name(m)}"
+        return s + (f" · {effort_label(self.effort).lower()}" if self.effort else "")
 
-        first = msgs[0]
-        replied = first.get("quote", {}).get("text")
-        if not replied:
-            r = first.get("reply_to_message") or {}
-            replied = r.get("text") or r.get("caption")
-        text = "\n\n".join(t for t in texts if t)
-        if replied:
-            text = f"> {replied[:1500]}\n\n{text}"
-        return {"role": "user", "text": text.strip(), "files": files}
-
-    def document(self, doc, files):
-        name = doc.get("file_name", "file")
-        mime = doc.get("mime_type", "")
-        if doc.get("file_size", 0) > FILE_LIMIT:
-            return f"[файл {name} слишком большой, читаю до 15 МБ]"
-        if mime.startswith("image/") or mime == "application/pdf":
-            files.append({"file_id": doc["file_id"], "mime": mime, "name": name})
-            return ""
-        if not (mime.startswith("text/") or name.lower().endswith(TEXT_FILES)):
-            return f"[файл {name}: такой формат я не читаю]"
-        if doc.get("file_size", 0) > TEXT_LIMIT:
-            return f"[файл {name} слишком большой, текстовые читаю до 300 КБ]"
-        try:
-            content = self.tg.download(doc["file_id"]).decode("utf-8", "replace")
-        except (TelegramError, OSError) as e:
-            return f"[файл {name} не скачался: {e}]"
-        return f"Файл {name}:\n```\n{content}\n```"
-
-    def enqueue(self, chat, entry, job):
-        # у каждого чата своя очередь. если пока модель отвечала, пришло ещё несколько
-        # вопросов, отвечаем на них разом, а не по очереди
-        q = self.queues.get(chat)
-        if q is None:
-            q = self.queues[chat] = queue.Queue()
-            threading.Thread(target=self.worker, args=(chat, q), daemon=True).start()
-        q.put((entry, job))
-
-    def worker(self, chat, q):
-        while True:
-            batch = [q.get()]
-            while not q.empty():
-                batch.append(q.get_nowait())
-            try:
-                for entry, _ in batch:
-                    if entry:
-                        self.store.remember(chat, entry)
-                batch[-1][1]()
-            except Exception as e:
-                log(f"ответ в {chat} упал: {e!r}")
-                self.tg.send(chat, f"⚠️ Что-то сломалось: <code>{plain(repr(e))[:300]}</code>")
-            finally:
-                for _ in batch:
-                    q.task_done()
-
-    def command(self, chat, cmd, user):
-        if cmd in ("/start", "/help"):
-            model = models.get(self.store.chat(chat)["model"])
-            name = f", {plain(user['first_name'])}" if user and user.get("first_name") else ""
-            self.tg.send(chat, HELP.format(model=model.name, name=name))
-        elif cmd == "/new":
-            self.store.reset(chat)
-            self.store.save()
-            self.tg.send(chat, "🧹 Начали с чистого листа. О чём поговорим?")
-        elif cmd in ("/model", "/mode", "/settings"):
-            text, markup = self.menu(chat)
-            self.tg.send(chat, text, markup=markup)
-
-    def menu(self, chat):
-        conf = self.store.chat(chat)
-        model = models.get(conf["model"])
-        effort = models.effort_for(model, conf["effort"])
-        web = conf.get("web", True)
-
-        abilities = " и ".join(a for a in ("фото" if model.vision else "",
-                                           "PDF" if model.pdf else "") if a)
-        lines = ["<b>⚙️ Настройки</b>", "",
-                 f"🧠 Модель: <b>{model.name}</b>" + (f" · видит {abilities}" if abilities else "")]
-        if effort:
-            lines.append(f"💭 Режим: <b>{models.EFFORTS[effort]}</b> — {EFFORT_HINTS[effort]}")
+    def live_md(self, frame=0):
+        parts = self.snapshot()
+        steps, answer, todos = analyze(parts)
+        n = sum(1 for s in steps if s[0] == "tool")
+        if self.stopped:
+            status = "✋ **Останавливаю**"
+        elif self.waiting_user():
+            status = "❓ **Жду вашего ответа**"
+        elif self.retry:
+            status = f"🔁 **Модель занята, повтор #{self.retry.get('attempt', 1)}**"
         else:
-            lines.append("💭 У этой модели нет режимов размышлений")
-        lines.append("🌐 Интернет: " + ("<b>включён</b>, ищу сам, когда нужно" if web
-                                        else "<b>выключен</b>"))
+            status = activity_md(parts)
+        head = f"{SPINNER[frame % len(SPINNER)]} {status} · {fmt_dur(time.time() - self.started)}"
+        if n:
+            head += f" · {n} {plural(n, 'шаг', 'шага', 'шагов')}"
+        out = [head]
+        if steps:
+            out.append(steps_quote(steps))
+        if todos:
+            out.append(plan_md(todos))
+        if answer:
+            if len(answer) > 20000:
+                answer = answer[-20000:]
+                answer = answer[answer.find("\n\n") + 2:] if "\n\n" in answer else answer
+            out.append(prepare(answer, WORKDIR, upload=False)[0])
+        out.append(f"<footer>{self.badge()}</footer>")
+        return "\n\n".join(out)[:RICH_LIMIT]
 
-        rows = grid([{"text": ("✓ " if m.id == model.id else "") + m.name +
-                      (" 🖼" if m.vision else ""), "callback_data": f"model:{i}"}
-                     for i, m in enumerate(models.MODELS)], 2)
-        rows += grid([{"text": ("✓ " if e == effort else "") + models.EFFORTS[e],
-                       "callback_data": f"effort:{e}"} for e in model.efforts], 3)
-        rows.append([{"text": "🌐 Интернет: вкл" if web else "🌐 Интернет: выкл",
-                      "callback_data": "web"},
-                     {"text": "🧹 Новый диалог", "callback_data": "new"}])
-        return "\n".join(lines), {"inline_keyboard": rows}
+    def wait(self):
+        last_typing = 0.0
+        while not self.done.wait(0.5):
+            now = time.time()
+            if now - self.started > TIMEOUT and not self.timed_out:
+                self.timed_out = True
+                self.stop()
+                break
+            if not self.waiting_user() and now - last_typing >= 5:
+                last_typing = now
+                threading.Thread(target=tg, args=("sendChatAction",), daemon=True,
+                                 kwargs=dict(_timeout=10, _retries=1, chat_id=self.chat.id, action="typing")).start()
+            if self.finished(now):
+                break
+        if self.stopped:
+            self.settle()
 
-    def on_button(self, cb):
-        chat = cb["message"]["chat"]["id"]
-        if not self.allowed(cb.get("from", {}), chat):
-            return self.tg.answer_callback(cb["id"])
-        data = cb.get("data", "")
-        conf = self.store.chat(chat)
-
-        if data.startswith("model:"):
-            conf["model"] = models.MODELS[int(data[6:])].id
-            self.update_menu(cb, f"Модель: {models.get(conf['model']).name}")
-        elif data.startswith("effort:"):
-            conf["effort"] = data[7:]
-            self.update_menu(cb, f"Режим: {models.EFFORTS[conf['effort']]}")
-        elif data == "web":
-            conf["web"] = not conf.get("web", True)
-            self.update_menu(cb, "Интернет включён" if conf["web"] else "Интернет выключен")
-        elif data == "menu":
-            self.tg.answer_callback(cb["id"])
-            text, markup = self.menu(chat)
-            self.tg.send(chat, text, markup=markup)
-        elif data == "new":
-            self.store.reset(chat)
-            self.tg.answer_callback(cb["id"], "Начали новый диалог")
-            self.tg.send(chat, "🧹 Начали с чистого листа. О чём поговорим?")
-        elif data.startswith("ask:"):
-            question = self.store.data.get("buttons", {}).get(data[4:])
-            if not question:
-                return self.tg.answer_callback(cb["id"], "Кнопка устарела")
-            self.tg.answer_callback(cb["id"])
-            self.follow_up(chat, cb["message"]["message_id"], question, cb.get("from"))
-        elif data == "again":
-            self.again(cb)
-        self.store.save()
-
-    def update_menu(self, cb, note):
-        self.tg.answer_callback(cb["id"], note)
-        text, markup = self.menu(cb["message"]["chat"]["id"])
+    def finish(self):
+        """Post the final answer. Must never raise: the chat has to be left in a clean state."""
+        finished = time.time()
+        chat = self.chat
         try:
-            self.tg.edit(cb["message"]["chat"]["id"], cb["message"]["message_id"], text, markup)
-        except TelegramError as e:
-            log(e)
+            self._finish(finished)
+        except Exception:
+            log(traceback.format_exc())
+            send_md(chat, "⚠️ Не удалось оформить ответ — ошибка бота. Попробуйте ещё раз.")
+        finally:
+            if self.live:
+                self.live.delete()  # only after the answer is posted, so the chat never looks empty
+            react(chat.id, self.job.get("reply_to"))
+            log(f"-> answered #{self.job.get('reply_to')} in {time.time() - self.started:.1f} s "
+                f"({self.model}{'/' + self.effort if self.effort else ''}{', stopped' if self.stopped else ''})")
 
-    def follow_up(self, chat, message_id, question, user):
-        entry = {"role": "user", "text": question, "files": [], "msg": message_id,
-                 "button": True}
-        self.enqueue(chat, entry,
-                     lambda: self.responder.answer(chat, message_id, user, asked=question))
+    def _finish(self, finished):
+        chat = self.chat
+        for kind in ("question", "permission"):
+            pending = getattr(chat, kind)
+            if pending:
+                setattr(chat, kind, None)
+                if pending.get("msg"):
+                    edit_md(chat, pending["msg"], "❓ *Вопрос снят — задача завершилась*" if kind == "question"
+                            else "🔐 *Запрос снят — задача завершилась*")
 
-    def again(self, cb):
-        chat = cb["message"]["chat"]["id"]
-        history = self.store.chat(chat)["history"]
-        last = history[-1] if history else {}
-        pressed = cb["message"]["message_id"]
-        # переписать можно только последний ответ, иначе история разъедется
-        if last.get("role") == "assistant" and pressed not in (last.get("msg"), last.get("last")):
-            return self.tg.answer_callback(cb["id"], "Переписать можно только последний ответ")
-        self.tg.answer_callback(cb["id"], "Переписываю…")
+        parts, err = self.collect()
+        steps, answer, todos = analyze(parts)
+        if not answer:
+            narr = [v for k, v in steps if k == "narr"]
+            answer = narr[-1] if narr else ""
+        n = sum(1 for s in steps if s[0] == "tool")
+        header = premiumize(steps_block(steps, todos, steps_title(n, finished - self.started))) if n else ""
+        footer = ""
+        if self.timed_out:
+            footer = f"⏱ *Остановлено: задача шла дольше {fmt_dur(TIMEOUT)}*"
+        elif self.stopped:
+            footer = "✋ *Остановлено*"
+        elif err:
+            footer = "⚠️ " + md_escape(short(error_text(err), 600))
+        if not answer and not footer:
+            answer = "✅ Готово." if n else "🤷 Модель ничего не ответила. Попробуйте переформулировать."
+        meta = self.badge()
+        thought = sum(reasoning_seconds(p) for p in parts if p.get("type") == "reasoning")
+        if not n and thought >= 3:
+            # with tools the steps block already shows timing
+            meta += f" · 🧠 Думал {fmt_dur(thought)}"
+        footer = (footer + "\n\n" if footer else "") + premiumize(f"<footer>{meta}</footer>")
 
-        def job():
-            history = self.store.chat(chat)["history"]
-            if history and history[-1]["role"] == "assistant":
-                history.pop()
-            users = [h for h in history if h["role"] == "user"]
-            if not users:
-                return self.tg.send(chat, "Нечего переписывать — начни с вопроса 🙂")
-            q = users[-1]
-            asked = q["text"] if q.get("button") else None
-            self.responder.answer(chat, q.get("msg"), cb.get("from"), asked=asked)
-        self.enqueue(chat, None, job)
+        chunks = split_long(answer) if answer else [""]
+        prepared = [prepare(c, WORKDIR, upload=True) for c in chunks]
+        embedded = {p for _, media in prepared for _, _, p in media}
+        files = [f for f in changed_files(self.started - 1) if f not in embedded][:6]
+        markup = answer_keyboard(files)
+        if isinstance(err, str) and err.startswith(("🔑", "⏳")):
+            markup["inline_keyboard"].append([btn(f"{OPENCODE_ICON} Перейти на бесплатную модель", "fallback")])
+
+        reply_to = self.job.get("reply_to") if chat.last_seen != self.job.get("reply_to") else None
+        msg_id = None
+        for i, (md, media) in enumerate(prepared):
+            last = i == len(prepared) - 1
+            if i == 0 and header:
+                md = header + "\n\n" + md
+            if last and footer:
+                md = (md + "\n\n" + footer).strip()
+            plain = plain_icons(chunks[i] + ("\n\n" + re.sub(r"</?footer>", "", footer) if last and footer else "")).strip()
+            msg_id = send_rich(chat, md, media, reply_to if i == 0 else None,
+                               markup if last else None, plain=plain) or msg_id
+
+        chat.set_last_answer(msg_id, markup)
+        info = self.regen_info()
+        chat.last_regen = dict(info, engine=self.engine, model=self.model, parts=self.job["parts"],
+                               reply_to=self.job.get("reply_to")) if info else None
 
 
-def grid(buttons, width):
-    return [buttons[i:i + width] for i in range(0, len(buttons), width)]
+class OpenCodeRun(Run):
+    engine = "opencode"
+
+    def __init__(self, chat, job, sid):
+        super().__init__(chat, job)
+        self.sid = sid
+        self.parts = OrderedDict()
+        self.roles = {}
+        self.lock = threading.Lock()
+        self.busy_seen = False
+        self.user_mid = None
+        self._last_check = time.time()
+        self._idle_checks = 0
+
+    # events from the OpenCode server (SSE thread)
+    def on_event(self, ev):
+        t, p = ev.get("type"), ev.get("properties") or {}
+        changed = False
+        with self.lock:
+            if t == "message.updated":
+                info = p.get("info") or {}
+                self.roles[info.get("id")] = info.get("role")
+            elif t == "message.part.updated":
+                part = p.get("part") or {}
+                # the stream also carries the parts of our own prompt
+                if part.get("type") in ("text", "reasoning", "tool") and \
+                        self.roles.get(part.get("messageID")) == "assistant":
+                    self.parts[part["id"]] = part
+                    changed = True
+            elif t == "message.part.delta":
+                part = self.parts.get(p.get("partID"))
+                if part is not None and p.get("field") == "text":
+                    part["text"] = (part.get("text") or "") + (p.get("delta") or "")
+                    changed = True
+            elif t == "session.status":
+                st = p.get("status") or {}
+                if st.get("type") in ("busy", "retry"):
+                    self.busy_seen = True
+                self.retry = st if st.get("type") == "retry" else None
+                changed = True
+                if st.get("type") == "idle" and self.busy_seen:
+                    self.done.set()
+            elif t == "session.idle" and self.busy_seen:
+                self.done.set()
+            elif t == "session.error":
+                err = p.get("error") or {}
+                if err.get("name") != "MessageAbortedError":
+                    self.error = err
+        if changed:
+            self.changed()
+        if t == "question.asked":
+            threading.Thread(target=ask_question, args=(self.chat, p), daemon=True).start()
+        elif t == "permission.asked":
+            threading.Thread(target=ask_permission, args=(self.chat, p), daemon=True).start()
+
+    def snapshot(self):
+        with self.lock:
+            return [dict(p) for p in self.parts.values()]
+
+    def start(self):
+        with RUNS_LOCK:
+            RUNS[self.sid] = self
+        oc.prompt(self.sid, self.job["parts"], self.model, self.effort, self.chat.st.get("agent"))
+
+    def close(self):
+        with RUNS_LOCK:
+            RUNS.pop(self.sid, None)
+
+    def stop(self):
+        super().stop()
+        oc.abort(self.sid)
+
+    def finished(self, now):
+        # watchdog in case an idle event was missed
+        if now - self._last_check < 4:
+            return False
+        self._last_check = now
+        try:
+            busy = self.sid in oc.status()
+        except OpenCodeError:
+            busy = True
+        if busy:
+            self.busy_seen = True
+            self._idle_checks = 0
+        elif self.busy_seen or now - self.started > 8:
+            self._idle_checks += 1
+        return self._idle_checks >= 2
+
+    def settle(self):
+        for _ in range(20):
+            try:
+                if self.sid not in oc.status():
+                    break
+            except OpenCodeError:
+                break
+            time.sleep(0.5)
+
+    def collect(self):
+        parts, infos = self.snapshot(), []
+        try:
+            msgs = oc.messages(self.sid)
+            idx = max(i for i, m in enumerate(msgs) if m["info"]["role"] == "user")
+            self.user_mid = msgs[idx]["info"]["id"]
+            parts = [p for m in msgs[idx + 1:] for p in m.get("parts", [])
+                     if p.get("type") in ("text", "tool", "reasoning")]
+            infos = [m["info"] for m in msgs[idx + 1:]]
+        except (OpenCodeError, ValueError) as e:
+            log("finish: messages:", e)
+        err = self.error
+        for info in infos:
+            e = info.get("error")
+            if e and e.get("name") == "MessageAbortedError":
+                self.stopped_at = self.stopped_at or time.time()
+            elif e and not err:
+                err = e
+        for info in reversed(infos):
+            tk = info.get("tokens") or {}
+            cache = tk.get("cache") or {}
+            if tk.get("input") or cache.get("read"):
+                self.chat.context = tk.get("input", 0) + cache.get("read", 0) + cache.get("write", 0)
+                break
+        return parts, err
+
+    def regen_info(self):
+        return {"user_mid": self.user_mid, "sid": self.sid} if self.user_mid else None
+
+
+def friendly_claude_error(err):
+    if not err:
+        return None
+    low = err.lower()
+    if any(k in low for k in ("oauth", "unauthorized", "401", "invalid api key", "/login", "authentication",
+                              "not logged in", "subscription", "credit balance")):
+        return ("🔑 Claude недоступен: закончилась подписка или слетела авторизация. "
+                "Можно переключиться на бесплатную модель.")
+    if any(k in low for k in ("rate limit", "usage limit", "limit reached", "rate_limit")):
+        return "⏳ Лимит Claude на сейчас исчерпан. Попробуйте позже или выберите бесплатную модель."
+    return err
+
+
+def claude_refs(st):
+    """Session ids that dialogs still point at (their files must stay)."""
+    refs = set()
+    for d in [st.get("claude") or {}] + list(st.get("claude_dialogs") or []):
+        refs.update(x for x in (d.get("sid"), d.get("prev")) if x)
+    return refs
+
+
+def dialog_title(parts):
+    text = next((p["text"] for p in parts if p.get("type") == "text"), "")
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith((">", "[Пользователь"))]
+    return short(lines[0] if lines else "Диалог", 48)
+
+
+class ClaudeRun(Run):
+    """A turn of Claude Code (`claude -p`), resumed from the dialog's last session with --fork-session."""
+    engine = "claude"
+
+    def __init__(self, chat, job):
+        super().__init__(chat, job)
+        cl = chat.st.get("claude") or {}
+        self.base = job.get("base") if job.get("regen") else cl.get("sid")
+        self.turn = None
+        self.new_sid = None
+
+    def start(self):
+        self.turn = claude.start(self.job["parts"], self.model.split("/", 1)[1], self.effort, resume=self.base,
+                                 plan=self.chat.st.get("agent") == "plan", on_change=self._on_change)
+
+    def _on_change(self):
+        if self.turn is not None and self.turn.done.is_set():
+            self.done.set()
+        self.changed()
+
+    def snapshot(self):
+        return self.turn.snapshot() if self.turn else []
+
+    def stop(self):
+        super().stop()
+        if self.turn:
+            self.turn.stop()
+
+    def finished(self, now):
+        return bool(self.turn and self.turn.done.is_set())
+
+    def settle(self):
+        if self.turn:
+            self.turn.done.wait(8)
+
+    def collect(self):
+        t = self.turn
+        parts = self.snapshot()
+        err = self.error or (None if self.stopped or not t else t.error())
+        if t:
+            if t.context:
+                self.chat.context = t.context
+            if t.rate_limit:
+                CLAUDE_LIMITS.update(t.rate_limit)
+            self._advance(t, parts, err)
+        return parts, friendly_claude_error(err)
+
+    def _advance(self, t, parts, err):
+        """Point the dialog at the new session and drop transcripts nobody needs any more."""
+        new = t.session_id if t.session_id and t.session_id != self.base else None
+        if not new:
+            return
+        if not parts and err:  # nothing happened in this fork
+            claude.forget(new)
+            return
+        st = self.chat.st
+        cl = st.setdefault("claude", {})
+        superseded = cl.get("sid") if self.job.get("regen") else cl.get("prev")
+        cl.update(sid=new, prev=self.base, updated=time.time())
+        cl.setdefault("title", dialog_title(self.job["parts"]))
+        self.new_sid = new
+        save_state()
+        if superseded and superseded not in claude_refs(st):
+            claude.forget(superseded)
+
+    def regen_info(self):
+        return {"base": self.base, "sid": self.new_sid} if self.new_sid else None
+
+
+def changed_files(since):
+    return [p for mt, _, p in sorted(walk_files(), reverse=True) if mt >= since]
+
+
+def answer_keyboard(files):
+    rows = [[btn("🔁 Ещё раз", "regen"), btn("🆕 Новый диалог", "new")]]
+    fb = [btn(f"📎 {short(p.name, 26)}", f"f:{file_token(p)}") for p in files]
+    rows += [fb[i:i + 2] for i in range(0, len(fb), 2)]
+    return {"inline_keyboard": rows}
+
+
+def opencode_session(chat, job):
+    """The chat's OpenCode session (created if needed), or None after telling the user."""
+    st = chat.st
+    try:
+        sid = st.get("session")
+        if sid and oc.session(sid) is None:
+            sid = None
+        if not sid:
+            sid = oc.create_session()
+            st["session"] = sid
+            save_state()
+        if job.get("revert"):
+            try:
+                oc.revert(sid, job["revert"])
+            except OpenCodeError as e:
+                log("revert:", e)
+        return sid
+    except OpenCodeError as e:
+        log("execute:", e)
+        send_md(chat, "⚠️ **Сервер OpenCode не отвечает.** Попробуйте через минуту.\n\n" + code(e, 300),
+                reply_to=job.get("reply_to"))
+        return None
+
+
+def execute(chat, job):
+    st = chat.st
+    job.setdefault("model", st["model"])
+    job.setdefault("effort", effort_for(st, job["model"]))
+    react(chat.id, job.get("reply_to"), "👀")
+    if engine_of(job["model"]) == "claude":
+        if not claude.available():
+            send_md(chat, f"🔑 **Claude не подключён.** Выберите бесплатную модель в /settings.",
+                    markup={"inline_keyboard": [[btn(f"{OPENCODE_ICON} Перейти на бесплатную модель", "fallback")]]},
+                    reply_to=job.get("reply_to"))
+            react(chat.id, job.get("reply_to"))
+            return
+        run = ClaudeRun(chat, job)
+    else:
+        sid = opencode_session(chat, job)
+        if sid is None:
+            react(chat.id, job.get("reply_to"))
+            return
+        run = OpenCodeRun(chat, job, sid)
+    if chat.cancelled:
+        react(chat.id, job.get("reply_to"))
+        return
+
+    chat.run = run
+    try:
+        run.live = LiveMessage(run)
+        run.start()
+        run.wait()
+    except (OpenCodeError, OSError) as e:
+        log("run:", e)
+        run.error = str(e)
+    finally:
+        run.close()
+        if run.live:
+            run.live.close()
+    run.finish()
+
+# ---------- chats ----------
+
+class Chat:
+    def __init__(self, chat_id, ctype):
+        self.id = chat_id
+        self.private = ctype == "private"
+        self.queue = Queue()
+        self.run = None
+        self.question = None
+        self.permission = None
+        self.last_regen = None
+        self.last_markup = None
+        self.context = None
+        self.last_seen = 0
+        self.albums = {}
+        self.album_timers = {}   # gid -> Timer, чтобы /stop отменял и их
+        self.batch = []          # сообщения без media_group_id для склейки в один запрос
+        self.batch_timer = None
+        self.caption = []        # фото без текста: ждут подпись с заданием до CAPTION_WAIT
+        self.caption_timer = None
+        self.lock = threading.Lock()
+        self.pending = 0         # queued + running jobs
+        self.cancelled = False   # /stop arrived before the current job reached the model
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    @property
+    def st(self):
+        return chat_state(self.id)
+
+    def loop(self):
+        while True:
+            job = self.queue.get()
+            self.cancelled = False
+            try:
+                execute(self, job)
+            except Exception:
+                log(traceback.format_exc())
+                send_md(self, "⚠️ Внутренняя ошибка бота. Попробуйте ещё раз.")
+                react(self.id, job.get("reply_to"))
+            finally:
+                self.run = None
+                with self.lock:
+                    self.pending -= 1
+
+    def busy(self):
+        return self.pending > 0
+
+    def stop(self):
+        drop_pending(self)
+        dropped = 0
+        while True:
+            try:
+                job = self.queue.get_nowait()
+            except Empty:
+                break
+            dropped += 1
+            react(self.id, job.get("reply_to"))
+        with self.lock:
+            self.pending -= dropped
+            working = self.pending > 0
+        if self.question:
+            try:
+                oc.question_reject(self.question["id"])
+            except OpenCodeError:
+                pass
+        run = self.run
+        if run:
+            run.stop()
+        elif working:
+            self.cancelled = True
+        return working, dropped
+
+    def strip_answer_buttons(self):
+        """Leave only file buttons on the previous answer."""
+        old = self.st.get("last_answer")
+        if old:
+            rows = (self.last_markup or {}).get("inline_keyboard", [])[1:]
+            tg_async("editMessageReplyMarkup", chat_id=self.id, message_id=old, reply_markup={"inline_keyboard": rows})
+        self.st["last_answer"] = None
+
+    def set_last_answer(self, msg_id, markup):
+        if self.st.get("last_answer") != msg_id:
+            self.strip_answer_buttons()
+        self.st["last_answer"] = msg_id
+        self.last_markup = markup
+        save_state()
+
+    def enqueue(self, job):
+        with self.lock:
+            busy = self.pending > 0
+            self.pending += 1
+        if busy:
+            react(self.id, job.get("reply_to"), "👌")
+        self.queue.put(job)
+
+
+CHATS = {}
+CHATS_LOCK = threading.Lock()
+
+
+def get_chat(chat_id, ctype="private"):
+    with CHATS_LOCK:
+        if chat_id not in CHATS:
+            CHATS[chat_id] = Chat(chat_id, ctype)
+        return CHATS[chat_id]
+
+
+# ---------- questions and permissions from the agent ----------
+
+def ask_question(chat, props):
+    chat.question = {"id": props["id"], "items": props.get("questions") or [], "idx": 0,
+                     "answers": [], "selected": [], "msg": None}
+    show_question(chat)
+
+
+def question_view(q):
+    item = q["items"][q["idx"]]
+    head = md_escape(item.get("header") or "Вопрос")
+    count = f" · {q['idx'] + 1}/{len(q['items'])}" if len(q["items"]) > 1 else ""
+    md = f"❓ **{head}**{count}\n\n" + prepare(item.get("question", ""), WORKDIR, upload=False)[0]
+    opts = item.get("options") or []
+    described = [o for o in opts if o.get("description") and o["description"] != o.get("label")]
+    if described:
+        md += "\n\n" + "\n".join(f"- **{md_escape(o['label'])}** — {md_escape(o['description'])}" for o in described)
+    if item.get("custom", True):
+        md += "\n\n_Или напишите свой ответ сообщением._"
+    rows = []
+    for i, o in enumerate(opts):
+        mark = "✅ " if i in q["selected"] else ""
+        rows.append([btn(mark + short(o.get("label", "?"), 40), f"q:{i}")])
+    last = []
+    if item.get("multiple"):
+        last.append(btn("✔️ Готово", "q:done", "success"))
+    last.append(btn("⏭ Пропустить", "q:skip"))
+    rows.append(last)
+    return md, {"inline_keyboard": rows}
+
+
+def show_question(chat):
+    q = chat.question
+    if not q or not q["items"]:
+        return
+    md, kb = question_view(q)
+    if q["msg"]:
+        edit_md(chat, q["msg"], md, kb)
+    else:
+        q["msg"] = send_md(chat, md, kb)
+
+
+def answer_question(chat, labels):
+    q = chat.question
+    if not q:
+        return
+    q["answers"].append(labels)
+    q["idx"] += 1
+    q["selected"] = []
+    if q["idx"] < len(q["items"]):
+        show_question(chat)
+        return
+    chat.question = None
+    summary = "\n\n".join(f"❓ {md_escape(it.get('header') or 'Вопрос')} → ✅ **{md_escape(', '.join(a) or '—')}**"
+                          for it, a in zip(q["items"], q["answers"]))
+    if q["msg"]:
+        edit_md(chat, q["msg"], summary)
+    try:
+        oc.question_reply(q["id"], q["answers"])
+    except OpenCodeError as e:
+        send_md(chat, "⚠️ Не удалось передать ответ: " + md_escape(str(e)))
+
+
+def ask_permission(chat, props):
+    pats = ", ".join(props.get("patterns") or [])
+    md = (f"🔐 **Агент просит разрешение**\n\n{md_escape(props.get('permission', ''))}"
+          + (f": {code(pats, 200)}" if pats else ""))
+    kb = {"inline_keyboard": [[btn("✅ Разрешить", "p:once", "success"), btn("♾ Всегда", "p:always"),
+                               btn("⛔ Запретить", "p:reject", "danger")]]}
+    chat.permission = {"id": props["id"], "md": md, "msg": None}
+    chat.permission["msg"] = send_md(chat, md, kb)
+
+
+# ---------- screens ----------
+
+def welcome_md(chat):
+    m = model_info(chat.st["model"])
+    claude_line = (f"- {CLAUDE_ICON} Claude Opus 5.5, Fable 5.1 и другие — по вашей подписке\n"
+                   if claude.available() else "")
+    return (f"# 👋 Привет!\n\nЯ — ИИ-агент со своим сервером. Сейчас отвечает "
+            f"**{engine_icon(m['id'])} {md_escape(short_name(m))}**. Пишите задачу обычным текстом: "
+            "я подумаю, при необходимости запущу код и отвечу.\n\n"
+            "- 🧮 Формулы, таблицы и код прямо в чате: $e^{i\\pi} + 1 = 0$\n"
+            "- 🖼 Понимаю фото, PDF и файлы\n"
+            "- 📈 Рисую графики и присылаю готовые файлы\n"
+            + claude_line +
+            "- 💬 Помню контекст, пока не начнёте новый диалог\n\n"
+            "**Попробуйте:**")
+
+
+def welcome_kb():
+    return {"inline_keyboard": [[btn(label, f"x:{i}") for i, (label, _) in enumerate(EXAMPLES)],
+                                [btn("⚙️ Настройки", "settings"), btn("❓ Помощь", "help")]]}
+
+
+HELP_MD = """## ❓ Как пользоваться
+
+- Просто пишите — сообщение уходит модели, контекст диалога сохраняется.
+- Пока модель работает, видно её шаги и текст ответа. Кнопка **⏹ Остановить** прерывает ответ.
+- Можно присылать фото, альбомы, PDF и файлы — они сохраняются в папку агента. Голосовые пока не понимаю.
+- Ответьте на сообщение (reply), чтобы процитировать его в вопросе.
+- Сообщения, отправленные во время работы, встают в очередь — на них появится 👌.
+- Модель и глубину рассуждений меняйте в /settings: нажмите на модель — и выберите уровень.
+
+**Команды**
+
+- /new — новый диалог
+- /stop — остановить ответ
+- /settings — модель, рассуждения, режим
+- /sessions — прошлые диалоги
+- /files — файлы агента"""
+
+
+def limits_text():
+    """Claude subscription usage from the last rate_limit_event, e.g. «24% за 5 ч · 16% за неделю»."""
+    info = CLAUDE_LIMITS
+    if not info:
+        return None
+    if info.get("status") == "rejected" and info.get("resetsAt"):
+        return "исчерпан до " + time.strftime("%H:%M", time.localtime(info["resetsAt"]))
+    names = {"five_hour": "за 5 ч", "seven_day": "за неделю"}
+    parts = [f"{round(w.get('utilization', 0) * 100)}% {names.get(k, k)}"
+             for k, w in (info.get("unifiedWindows") or {}).items() if k in names]
+    return " · ".join(parts) or None
+
+
+def dialog_line(chat):
+    st = chat.st
+    m = model_info(st["model"])
+    title = None
+    if engine_of(st["model"]) == "claude":
+        title = (st.get("claude") or {}).get("title")
+    else:
+        try:
+            sess = oc.session(st["session"]) if st.get("session") else None
+        except OpenCodeError:
+            sess = None
+        title = sess and (sess.get("title") or "без названия")
+    if not title:
+        return "новый"
+    line = f"«{md_escape(short(title, 50))}»"
+    if chat.context and m.get("context"):
+        line += f" · контекст {fmt_num(chat.context)} из {fmt_num(m['context'])}"
+    return line
+
+
+def settings_view(chat):
+    st = chat.st
+    m = model_info(st["model"])
+    eff = effort_for(st)
+    agent = st.get("agent", "build")
+    lines = [f"## ⚙️ Настройки", "", f"### {engine_icon(m['id'])} {md_escape(m['name'])}", ""]
+    if eff:
+        lines.append(f"- 🧠 **Рассуждения:** {meter(m, eff)} {effort_label(eff)}")
+    lines.append("- 🛠 **Режим:** агент — выполняет команды и меняет файлы" if agent == "build"
+                 else "- 📋 **Режим:** план — только анализирует и предлагает")
+    lines.append(f"- 💬 **Диалог:** {dialog_line(chat)}")
+    if engine_of(m["id"]) == "claude" and limits_text():
+        lines.append(f"- 📊 **Лимит подписки Claude:** {limits_text()}")
+    md = "\n".join(lines)
+
+    rows = [[btn(f"🤖 Модель · {short_name(m)}", "models")]]
+    if eff:
+        rows.append([btn(f"🧠 Рассуждения · {effort_label(eff)}", "reasoning")])
+    rows.append([btn(("✓ " if agent == "build" else "") + "🛠 Агент", "a:build", "primary" if agent == "build" else None),
+                 btn(("✓ " if agent == "plan" else "") + "📋 План", "a:plan", "primary" if agent == "plan" else None)])
+    rows.append([btn("🗂 Диалоги", "sessions"), btn("📁 Файлы", "files")])
+    rows.append([btn("🆕 Новый диалог", "new"), btn("✖️ Закрыть", "close")])
+    return md, {"inline_keyboard": rows}
+
+
+def models_view(chat):
+    st = chat.st
+    cur = st["model"]
+    lines = ["## 🤖 Модель", "", "Нажмите на модель — затем выберите глубину рассуждений.", ""]
+    if claude.available():
+        lines.append(f"- {CLAUDE_ICON} **Claude** — по вашей подписке")
+    else:
+        lines.append(f"- {CLAUDE_ICON} **Claude** — не подключён")
+    lines.append(f"- {OPENCODE_ICON} **OpenCode** — бесплатные модели")
+    rows = []
+    for i, m in enumerate(models()):
+        on = m["id"] == cur
+        tail = f" · {effort_label(effort_for(st, m['id']))}" if on and m["variants"] else ""
+        rows.append([btn(f"{'✓ ' if on else ''}{engine_icon(m['id'])} {short_name(m)}{tail}", f"m:{i}",
+                         "primary" if on else None)])
+    rows.append([btn("‹ Назад", "settings")])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def effort_view(chat, i):
+    m = models()[i]
+    cur = effort_for(chat.st, m["id"])
+    md = (f"## 🧠 {engine_icon(m['id'])} {md_escape(m['name'])}\n\n"
+          "Выберите глубину рассуждений: глубже — умнее, но дольше.")
+    rows = [[btn(f"{'✓ ' if v == cur else ''}{meter(m, v)} {effort_label(v)} — {EFFORTS.get(v, ('', ''))[1]}",
+                 f"e:{i}:{v}", "primary" if v == cur else None)] for v in m["variants"]]
+    rows.append([btn("‹ К моделям", "models")])
+    return md, {"inline_keyboard": rows}
+
+
+def claude_dialogs(st):
+    """(updated, title, callback data, is_current) for the chat's Claude dialogs."""
+    out = []
+    cur = st.get("claude") or {}
+    on_claude = engine_of(st["model"]) == "claude"
+    if cur.get("sid"):
+        out.append((cur.get("updated", 0), cur.get("title") or "Диалог", "cd:cur", on_claude))
+    for j, d in enumerate(st.get("claude_dialogs") or []):
+        out.append((d.get("updated", 0), d.get("title") or "Диалог", f"cd:{j}", False))
+    return out
+
+
+def sessions_view(chat):
+    st = chat.st
+    on_opencode = engine_of(st["model"]) == "opencode"
+    items = [(u, f"{CLAUDE_ICON} {t}", d, c) for u, t, d, c in claude_dialogs(st)]
+    note = ""
+    try:
+        for s_ in oc.sessions():
+            if not s_.get("parentID"):
+                items.append(((s_.get("time") or {}).get("updated", 0) / 1000,
+                              f"{OPENCODE_ICON} {s_.get('title') or 'без названия'}", f"s:{s_['id']}",
+                              on_opencode and s_["id"] == st.get("session")))
+    except OpenCodeError:
+        note = "\n\n_Список бесплатных диалогов сейчас недоступен._"
+    items.sort(key=lambda x: -x[0])
+    rows = [[btn(("✓ " if c else "") + short(t, 34) + " · " + ago(u), d, "primary" if c else None)]
+            for u, t, d, c in items[:10]]
+    rows.append([btn("🆕 Новый диалог", "new"), btn("‹ Назад", "settings")])
+    md = "## 🗂 Диалоги\n\n" + ("Выберите, чтобы продолжить:" if items else "Пока нет сохранённых диалогов.") + note
+    return md, {"inline_keyboard": rows}
+
+
+def files_view(chat):
+    items = sorted(walk_files(SKIP_DIRS - {"uploads"}), reverse=True)[:10]
+    rows = [[btn(f"📄 {short(rel(p), 30)} · {fmt_size(size)} · {ago(mt)}", f"f:{file_token(p)}")]
+            for mt, size, p in items]
+    rows.append([btn("‹ Назад", "settings")])
+    md = "## 📁 Файлы\n\nРабочая папка агента. Нажмите на файл, чтобы получить его:" if items else \
+        "## 📁 Файлы\n\nПока пусто — агент ещё ничего не создал."
+    return md, {"inline_keyboard": rows}
+
+
+def show_screen(chat, view, msg_id=None):
+    md, kb = view(chat) if callable(view) else view
+    if msg_id:
+        edit_md(chat, msg_id, md, kb)
+    else:
+        send_md(chat, md, kb)
+
+
+def send_file(chat, path):
+    path = Path(path)
+    if not path.is_file():
+        send_md(chat, f"Файл {code(rel(path))} не найден")
+        return
+    r = tg.upload("sendDocument", {"document": path}, chat_id=chat.id)
+    if not r.get("ok"):
+        send_md(chat, "⚠️ " + md_escape(r.get("description", "не удалось отправить")))
+
+
+def archive_claude(st):
+    """Move the current Claude dialog into the list of past ones."""
+    cur = st.get("claude") or {}
+    if cur.get("sid"):
+        st.setdefault("claude_dialogs", []).insert(0, cur)
+        del st["claude_dialogs"][20:]
+    st["claude"] = {}
+
+
+def use_model(st, model_id):
+    st["model"] = model_id
+    st.setdefault("last_model", {})[engine_of(model_id)] = model_id
+
+
+def new_dialog(chat, edit_msg=None):
+    chat.stop()
+    chat.strip_answer_buttons()
+    chat.st["session"] = None
+    archive_claude(chat.st)
+    chat.context = None
+    chat.last_regen = None
+    save_state()
+    md = "🆕 **Новый диалог.** Контекст очищен — пишите."
+    if edit_msg:
+        edit_md(chat, edit_msg, md)
+    else:
+        send_md(chat, md)
+
+
+# ---------- incoming updates ----------
+
+def handle_command(chat, msg, text):
+    cmd, _, arg = text.partition(" ")
+    cmd = cmd.split("@")[0].lower()
+    arg = arg.strip()
+    if cmd == "/start":
+        send_md(chat, welcome_md(chat), welcome_kb())
+    elif cmd == "/help":
+        send_md(chat, HELP_MD)
+    elif cmd == "/new":
+        new_dialog(chat)
+    elif cmd == "/stop":
+        running, dropped = chat.stop()
+        parts = ["⏹ Останавливаю." if running else "Сейчас ничего не выполняется."]
+        if dropped:
+            parts.append(f"Убрал из очереди: {dropped}.")
+        send_md(chat, " ".join(parts))
+    elif cmd in ("/settings", "/model", "/effort"):
+        show_screen(chat, settings_view)
+    elif cmd == "/sessions":
+        show_screen(chat, sessions_view)
+    elif cmd == "/files":
+        show_screen(chat, files_view)
+    elif cmd == "/get":
+        p = Path(os.path.expanduser(arg))
+        send_file(chat, p if p.is_absolute() else WORKDIR / p)
+    else:
+        return False
+    return True
+
+
+def attachment(msg):
+    """Download media from a message: (path, mime) or None."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if msg.get("photo"):
+        ph = msg["photo"][-1]
+        return tg.download(ph["file_id"], UPLOADS / f"photo-{stamp}-{ph['file_unique_id'][:6]}.jpg"), "image/jpeg"
+    for key, default_name, default_mime in (("document", "file", "application/octet-stream"),
+                                             ("audio", "audio.mp3", "audio/mpeg"),
+                                             ("video", "video.mp4", "video/mp4"),
+                                             ("video_note", "video_note.mp4", "video/mp4"),
+                                             ("animation", "animation.mp4", "video/mp4")):
+        m = msg.get(key)
+        if m:
+            name = re.sub(r"[^\w.\- ]", "_", m.get("file_name") or default_name)
+            path = UPLOADS / f"{stamp}-{name}"
+            mime = m.get("mime_type") or mimetypes.guess_type(name)[0] or default_mime
+            return tg.download(m["file_id"], path), mime
+    return None
+
+
+def file_part(path, mime):
+    ext = path.suffix.lower()
+    if mime.startswith("image/") and ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        return {"type": "file", "mime": mime, "filename": path.name, "url": f"file://{path}"}
+    if mime == "application/pdf":
+        return {"type": "file", "mime": mime, "filename": path.name, "url": f"file://{path}"}
+    if mime.startswith("text/") or ext in TEXT_EXT:
+        return {"type": "file", "mime": "text/plain", "filename": path.name, "url": f"file://{path}"}
+    return None
+
+
+def process_messages(chat, msgs):
+    first = msgs[0]
+    text = "\n".join(m.get("text") or m.get("caption") or "" for m in msgs).strip()
+    has_media = any(k in m for m in msgs for k in MEDIA_KEYS)
+    if len(msgs) == 1 and text.startswith("/") and not has_media and handle_command(chat, first, text):
+        return
+    if chat.question and text and not has_media:
+        answer_question(chat, [text])
+        react(chat.id, first["message_id"], "👌")
+        return
+    if any("voice" in m for m in msgs) and not text:
+        send_md(chat, "🎙 Голосовые пока не понимаю — напишите, пожалуйста, текстом.", reply_to=first["message_id"])
+        return
+    if not text and not has_media and first.get("sticker"):
+        text = first["sticker"].get("emoji") or ""
+
+    parts, notes = [], []
+    for m in msgs:
+        try:
+            got = attachment(m)
+        except Exception as e:
+            send_md(chat, "⚠️ Не удалось скачать файл: " + md_escape(str(e)), reply_to=m["message_id"])
+            return
+        if not got:
+            continue
+        path, mime = got
+        part = file_part(path, mime)
+        if part:
+            parts.append(part)
+        notes.append(f"[Пользователь прислал файл: `{rel(path)}` ({mime}); он сохранён в рабочей папке.]")
+
+    rt = first.get("reply_to_message")
+    quote = (first.get("quote") or {}).get("text")
+    if not quote and rt:
+        quote = rt.get("text") or rt.get("caption")
+    body = text or ("Посмотри вложение." if notes else "")
+    if not body:
+        return
+    if quote:
+        body = "> " + short(quote, 1500).replace("\n", "\n> ") + "\n\n" + body
+    if notes:
+        body += "\n\n" + "\n".join(notes)
+    parts.insert(0, {"type": "text", "text": body})
+    chat.enqueue({"parts": parts, "reply_to": first["message_id"]})
+
+
+def flush_burst(chat):
+    with chat.lock:
+        msgs = chat.batch
+        chat.batch = []
+        chat.batch_timer = None
+    if msgs:
+        try:
+            park_or_send(chat, sorted(msgs, key=lambda m: m["message_id"]))
+        except Exception:
+            log(traceback.format_exc())
+
+
+def flush_caption(chat):
+    with chat.lock:
+        msgs = chat.caption
+        chat.caption = []
+        chat.caption_timer = None
+    if msgs:
+        try:
+            process_messages(chat, sorted(msgs, key=lambda m: m["message_id"]))
+        except Exception:
+            log(traceback.format_exc())
+
+
+def drop_pending(chat):
+    """Убрать несклеенные и припаркованные сообщения (для /stop)."""
+    with chat.lock:
+        chat.batch = []
+        t1 = chat.batch_timer
+        chat.batch_timer = None
+        chat.caption = []
+        t2 = chat.caption_timer
+        chat.caption_timer = None
+        chat.albums = {}
+        album_timers = dict(chat.album_timers)
+        chat.album_timers = {}
+    for t in [t1, t2, *album_timers.values()]:
+        if t is not None:
+            t.cancel()
+
+
+def park_or_send(chat, msgs):
+    """Пачка с фото, но без текста — ждёт подпись CAPTION_WAIT, остальное сразу."""
+    text = "\n".join(m.get("text") or m.get("caption") or "" for m in msgs).strip()
+    has_media = any(k in m for m in msgs for k in MEDIA_KEYS)
+    if has_media and not text:
+        with chat.lock:
+            chat.caption.extend(msgs)
+            first = chat.caption[0]["message_id"]
+            if chat.caption_timer is None:
+                chat.caption_timer = threading.Timer(CAPTION_WAIT, lambda: flush_caption(chat))
+                chat.caption_timer.daemon = True
+                chat.caption_timer.start()
+        react(chat.id, first, "👌")
+        return
+    with chat.lock:
+        parked = chat.caption
+        chat.caption = []
+        t = chat.caption_timer
+        chat.caption_timer = None
+    if t is not None:
+        t.cancel()
+    all_msgs = sorted(parked + msgs, key=lambda m: m["message_id"]) if parked else msgs
+    process_messages(chat, all_msgs)
+
+
+def handle_message(msg):
+    chat_id = msg["chat"]["id"]
+    user = msg.get("from") or {}
+    if user.get("id") not in ALLOWED:
+        log(f"denied user {user.get('id')} ({user.get('username')}) in chat {chat_id}")
+        if msg["chat"]["type"] == "private":
+            tg("sendMessage", chat_id=chat_id, text=f"Нет доступа. Ваш Telegram id: {user.get('id')}")
+        return
+    chat = get_chat(chat_id, msg["chat"]["type"])
+    chat.last_seen = max(chat.last_seen, msg["message_id"])
+    PREMIUM["on"] = bool(user.get("is_premium"))
+    kind = next((k for k in ("text",) + MEDIA_KEYS + ("sticker",) if k in msg), "other")
+    log(f"<- {kind} #{msg['message_id']} (in Telegram {max(0, int(time.time() - msg.get('date', time.time())))} s ago)")
+    gid = msg.get("media_group_id")
+    if gid:
+        album = chat.albums.get(gid)
+        if album is None:
+            album = chat.albums[gid] = []
+            react(chat.id, msg["message_id"], "👌")
+
+            def flush():
+                with chat.lock:
+                    chat.album_timers.pop(gid, None)
+                    msgs = chat.albums.pop(gid, [])
+                if not msgs:
+                    return
+                try:
+                    park_or_send(chat, sorted(msgs, key=lambda m: m["message_id"]))
+                except Exception:
+                    log(traceback.format_exc())
+            t = threading.Timer(1.5, flush)
+            t.daemon = True
+            chat.album_timers[gid] = t
+            t.start()
+        album.append(msg)
+        return
+    text = msg.get("text") or ""
+    has_media = any(k in msg for k in MEDIA_KEYS)
+    if text.startswith("/") and not has_media:
+        if text.split()[0] == "/stop":
+            drop_pending(chat)
+        else:
+            flush_burst(chat)
+            flush_caption(chat)
+        process_messages(chat, [msg])
+        return
+    if chat.question and text and not has_media:
+        process_messages(chat, [msg])
+        return
+    if has_media:
+        with chat.lock:
+            chat.batch.append(msg)
+            first = len(chat.batch) == 1 and not chat.caption
+            if chat.batch_timer is None:
+                chat.batch_timer = threading.Timer(BURST_WINDOW, lambda: flush_burst(chat))
+                chat.batch_timer.daemon = True
+                chat.batch_timer.start()
+        if first:
+            react(chat.id, msg["message_id"], "👌")
+        return
+    with chat.lock:
+        parked = chat.caption
+        chat.caption = []
+        t = chat.caption_timer
+        chat.caption_timer = None
+        if not parked:
+            join = bool(chat.batch)
+            if join:
+                chat.batch.append(msg)
+        else:
+            join = False
+    if t is not None:
+        t.cancel()
+    if parked:
+        process_messages(chat, sorted(parked + [msg], key=lambda m: m["message_id"]))
+        return
+    if join:
+        return
+    process_messages(chat, [msg])
+
+
+def handle_callback(cq):
+    user = cq.get("from") or {}
+    msg = cq.get("message") or {}
+    if user.get("id") not in ALLOWED or not msg:
+        tg("answerCallbackQuery", callback_query_id=cq["id"], text="Нет доступа")
+        return
+    note = None
+    try:
+        note = on_button(get_chat(msg["chat"]["id"], msg["chat"]["type"]), msg["message_id"], cq.get("data") or "")
+    except Exception:
+        log(traceback.format_exc())
+        note = "Ошибка — попробуйте ещё раз"
+    finally:
+        tg("answerCallbackQuery", callback_query_id=cq["id"], text=note)
+
+
+def on_button(chat, mid, data):
+    """Handle an inline button; returns an optional toast text."""
+    st = chat.st
+    if data == "stop":
+        running, _ = chat.stop()
+        return "Останавливаю…" if running else "Уже готово"
+    if data == "settings":
+        show_screen(chat, settings_view, mid)
+    elif data == "models":
+        show_screen(chat, models_view, mid)
+    elif data == "sessions":
+        show_screen(chat, sessions_view, mid)
+    elif data == "files":
+        show_screen(chat, files_view, mid)
+    elif data == "help":
+        send_md(chat, HELP_MD)
+    elif data == "close":
+        tg("deleteMessage", chat_id=chat.id, message_id=mid)
+    elif data == "new":
+        # from a settings screen: replace the screen; from an answer: post a new message
+        new_dialog(chat, None if mid == st.get("last_answer") else mid)
+        return "Новый диалог"
+    elif data == "reasoning":
+        lst = models()
+        i = next((k for k, m in enumerate(lst) if m["id"] == st["model"]), None)
+        if i is None or not lst[i]["variants"]:
+            return "У этой модели нет уровней рассуждений"
+        show_screen(chat, effort_view(chat, i), mid)
+    elif data.startswith("m:"):
+        lst = models()
+        i = int(data[2:])
+        if i >= len(lst):
+            show_screen(chat, models_view, mid)
+            return "Список моделей обновился"
+        m = lst[i]
+        if m["variants"]:
+            show_screen(chat, effort_view(chat, i), mid)
+            return None
+        return pick_model(chat, mid, m, None)
+    elif data.startswith("e:"):
+        _, *rest = data.split(":")
+        if len(rest) == 1:  # buttons from older settings screens: level for the current model
+            st.setdefault("efforts", {})[st["model"]] = rest[0]
+            save_state()
+            show_screen(chat, settings_view, mid)
+            return f"Рассуждения: {effort_label(rest[0])}"
+        lst = models()
+        i = int(rest[0])
+        if i >= len(lst) or rest[1] not in lst[i]["variants"]:
+            show_screen(chat, models_view, mid)
+            return "Список моделей обновился"
+        return pick_model(chat, mid, lst[i], rest[1])
+    elif data.startswith("a:"):
+        st["agent"] = "plan" if data == "a:plan" else "build"
+        save_state()
+        show_screen(chat, settings_view, mid)
+        return "Режим: только план" if data == "a:plan" else "Режим: агент"
+    elif data.startswith("s:"):
+        try:
+            sess = oc.session(data[2:])
+        except OpenCodeError:
+            return "Сервер OpenCode не отвечает"
+        if not sess:
+            show_screen(chat, sessions_view, mid)
+            return "Этого диалога уже нет"
+        st["session"] = data[2:]
+        if engine_of(st["model"]) != "opencode":
+            use_model(st, (st.get("last_model") or {}).get("opencode") or DEFAULT_MODEL)
+        switched_dialog(chat, mid, sess.get("title"))
+    elif data.startswith("cd:"):
+        if not claude.available():
+            return "Claude не подключён"
+        if data != "cd:cur":
+            j = int(data[3:])
+            past = st.get("claude_dialogs") or []
+            if j >= len(past):
+                show_screen(chat, sessions_view, mid)
+                return "Список диалогов обновился"
+            chosen = past.pop(j)
+            archive_claude(st)
+            st["claude"] = chosen
+        if engine_of(st["model"]) != "claude":
+            use_model(st, (st.get("last_model") or {}).get("claude") or DEFAULT_CLAUDE_MODEL)
+        switched_dialog(chat, mid, (st.get("claude") or {}).get("title"))
+    elif data == "fallback":
+        use_model(st, (st.get("last_model") or {}).get("opencode") or DEFAULT_MODEL)
+        save_state()
+        m = model_info(st["model"])
+        send_md(chat, f"{OPENCODE_ICON} Переключил на **{md_escape(m['name'])}**. Можно повторить вопрос.")
+        return short_name(m)
+    elif data.startswith("f:"):
+        path = FILE_TOKENS.get(data[2:])
+        if not path:
+            return "Ссылка устарела — откройте /files"
+        send_file(chat, path)
+    elif data.startswith("x:"):
+        i = int(data[2:])
+        if i >= len(EXAMPLES):
+            return None
+        prompt = EXAMPLES[i][1]
+        echo = send_md(chat, f"💬 _{md_escape(prompt)}_")
+        chat.enqueue({"parts": [{"type": "text", "text": prompt}], "reply_to": echo})
+    elif data == "regen":
+        lr = chat.last_regen
+        if chat.busy():
+            return "Подождите — я ещё отвечаю"
+        current = (st.get("claude") or {}).get("sid") if (lr or {}).get("engine") == "claude" else st.get("session")
+        if not lr or mid != st.get("last_answer") or lr.get("sid") != current:
+            return "Повторить можно только последний ответ"
+        chat.strip_answer_buttons()
+        save_state()
+        job = {"parts": lr["parts"], "reply_to": lr["reply_to"], "model": lr["model"]}
+        if lr["engine"] == "claude":
+            job.update(regen=True, base=lr["base"])
+        else:
+            job["revert"] = lr["user_mid"]
+        chat.enqueue(job)
+        return "Генерирую заново"
+    elif data.startswith("q:"):
+        return on_question_button(chat, mid, data)
+    elif data.startswith("p:"):
+        p = chat.permission
+        if not p:
+            return "Запрос уже закрыт"
+        chat.permission = None
+        reply = {"p:once": "once", "p:always": "always"}.get(data, "reject")
+        try:
+            oc.permission_reply(p["id"], reply)
+        except OpenCodeError as e:
+            log("permission reply:", e)
+        verdict = {"once": "✅ разрешено", "always": "♾ разрешено всегда", "reject": "⛔ запрещено"}[reply]
+        edit_md(chat, mid, p["md"] + f"\n\n**{verdict}**")
+    return None
+
+
+def pick_model(chat, mid, m, effort):
+    """Apply a model (and level) chosen on the picker, then return to settings."""
+    st = chat.st
+    was = engine_of(st["model"])
+    use_model(st, m["id"])
+    if effort:
+        st.setdefault("efforts", {})[m["id"]] = effort
+    save_state()
+    show_screen(chat, settings_view, mid)
+    note = short_name(m) + (f" · {effort_label(effort)}" if effort else "")
+    if engine_of(m["id"]) != was:
+        note += "\nУ Claude и бесплатных моделей свои диалоги — контекст не переносится"
+    return note
+
+
+def switched_dialog(chat, mid, title):
+    chat.context = None
+    chat.last_regen = None
+    chat.strip_answer_buttons()
+    save_state()
+    m = model_info(chat.st["model"])
+    edit_md(chat, mid, f"💬 Продолжаем диалог «{md_escape(short(title or 'без названия', 60))}» · "
+                       f"{engine_icon(m['id'])} {md_escape(short_name(m))}. Пишите.",
+            {"inline_keyboard": [[btn("‹ К диалогам", "sessions")]]})
+
+
+def on_question_button(chat, mid, data):
+    q = chat.question
+    if not q:
+        return "Вопрос уже закрыт"
+    item = q["items"][q["idx"]]
+    opts = item.get("options") or []
+    if data == "q:skip":
+        chat.question = None
+        edit_md(chat, mid, f"❓ {md_escape(item.get('header') or 'Вопрос')} → ⏭ пропущен")
+        try:
+            oc.question_reject(q["id"])
+        except OpenCodeError as e:
+            log("question reject:", e)
+    elif data == "q:done":
+        answer_question(chat, [opts[i]["label"] for i in sorted(q["selected"]) if i < len(opts)])
+    else:
+        i = int(data[2:])
+        if i >= len(opts):
+            return None
+        if item.get("multiple"):
+            q["selected"] = [x for x in q["selected"] if x != i] if i in q["selected"] else q["selected"] + [i]
+            show_question(chat)
+        else:
+            answer_question(chat, [opts[i]["label"]])
+    return None
+
+
+def dispatch(ev):
+    """Route a server event to the run waiting on its session."""
+    p = ev.get("properties") or {}
+    sid = p.get("sessionID") or (p.get("part") or {}).get("sessionID") or (p.get("info") or {}).get("sessionID")
+    with RUNS_LOCK:
+        run = RUNS.get(sid) if sid else None
+    if run:
+        try:
+            run.on_event(ev)
+        except Exception:
+            log(traceback.format_exc())
+
+
+def event_loop():
+    for ev in oc.events():
+        dispatch(ev)
+
+
+def setup_profile():
+    tg("setMyCommands", commands=[{"command": c, "description": d} for c, d in [
+        ("new", "🆕 Новый диалог"), ("stop", "⏹ Остановить ответ"), ("settings", "⚙️ Модель и настройки"),
+        ("sessions", "🗂 Прошлые диалоги"), ("files", "📁 Файлы агента"), ("help", "❓ Как пользоваться"),
+    ]])
+    desc = ("Агент OpenCode на модели Muse Spark 1.3: думает, пишет и запускает код, рисует графики, "
+            "разбирает фото и файлы. Формулы и таблицы — прямо в чате.")
+    if (tg("getMyDescription").get("result") or {}).get("description") != desc:
+        tg("setMyDescription", description=desc)
+    short_desc = "Muse Spark 1.3 через OpenCode: код, формулы, графики и файлы"
+    if (tg("getMyShortDescription").get("result") or {}).get("short_description") != short_desc:
+        tg("setMyShortDescription", short_description=short_desc)
 
 
 def main():
-    if not settings.tg_token:
-        sys.exit("не задан TG_TOKEN")
-    if not settings.api_key:
-        sys.exit("не задан OPENCODE_API_KEY")
-    Bot(Telegram(settings.tg_token)).run(settings.shift_minutes)
+    if not TOKEN:
+        raise SystemExit("TG_TOKEN не задан (.env)")
+    me = tg("getMe")
+    if not me.get("ok"):
+        raise SystemExit(f"getMe: {me}")
+    WORKDIR.mkdir(parents=True, exist_ok=True)
+    UPLOADS.mkdir(parents=True, exist_ok=True)
+    log(f"@{me['result']['username']} запущен; {DEFAULT_MODEL} ({DEFAULT_EFFORT}); папка {WORKDIR}; "
+        f"доступ: {sorted(ALLOWED) or 'никому'}")
+    setup_profile()
+    threading.Thread(target=event_loop, daemon=True).start()
+    offset = None
+    shift_until = None
+    shift_min = os.environ.get("SHIFT_MINUTES")
+    if shift_min:
+        try:
+            shift_until = time.time() + float(shift_min) * 60
+            log(f"Смена активна до {time.strftime('%H:%M:%S', time.localtime(shift_until))} ({shift_min} мин)")
+        except ValueError:
+            pass
+    while True:
+        if shift_until and time.time() >= shift_until:
+            log("Время смены истекло, ожидаю завершения текущих задач...")
+            while any(c.busy() for c in CHATS.values()):
+                time.sleep(2)
+            log("Все задачи завершены. Завершаю работу смены.")
+            break
+        r = tg("getUpdates", _timeout=35, _retries=1, timeout=25, offset=offset,
+               allowed_updates=["message", "callback_query"])
+        if not r.get("ok"):
+            if "timed out" not in r.get("description", ""):
+                log("getUpdates:", r.get("description"))
+                time.sleep(3)
+            continue
+        for upd in r["result"]:
+            offset = upd["update_id"] + 1
+            try:
+                if "message" in upd:
+                    handle_message(upd["message"])
+                elif "callback_query" in upd:
+                    handle_callback(upd["callback_query"])
+            except Exception:
+                log(traceback.format_exc())
 
 
 if __name__ == "__main__":

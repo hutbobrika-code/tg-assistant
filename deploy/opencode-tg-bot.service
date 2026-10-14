@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram bot for OpenCode
+After=network-online.target opencode-server.service
+Wants=network-online.target opencode-server.service
+
+[Service]
+User=ocbot
+Group=ocbot
+WorkingDirectory=/home/ocbot/opencode-tg-bot
+Environment=HOME=/home/ocbot
+Environment=PATH=/home/ocbot/.opencode/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 -u /home/ocbot/opencode-tg-bot/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
