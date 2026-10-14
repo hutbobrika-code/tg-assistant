@@ -74,12 +74,13 @@ def extract_firefox_cookies():
         cur = con.cursor()
         query = """
         SELECT name, value FROM moz_cookies 
-        WHERE (host LIKE '%google.com' OR host LIKE '%.google.com')
+        WHERE (host = '.google.com' OR host = 'google.com' OR host LIKE '%.google.com')
+        AND host NOT LIKE '%youtube%'
+        ORDER BY lastAccessed DESC
         """
         for name, val in cur.execute(query):
             if name in WANT and val:
-                # Берём наиболее длинное значение (как правило, более свежее)
-                if name not in cookies or len(val) > len(cookies[name]):
+                if name not in cookies:
                     cookies[name] = val
         con.close()
     finally:
