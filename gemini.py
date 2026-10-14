@@ -21,22 +21,40 @@ from tg import log
 
 IMAGE_MIME = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
+GEMINI_EFFORTS = ["low", "medium", "high"]
+
 GEMINI_MODELS = [
+    {
+        "id": "gemini/gemini-4-argon",
+        "name": "Gemini 4 Argon",
+        "short": "4 Argon",
+        "variants": GEMINI_EFFORTS,
+        "context": 1_000_000,
+        "description": "Сложные задачи (флагман Google Ultra/Advanced)",
+    },
     {
         "id": "gemini/gemini-3.1-pro",
         "name": "Gemini 3.1 Pro",
-        "short": "Gemini 3.1 Pro",
-        "variants": ["high"],
+        "short": "3.1 Pro",
+        "variants": GEMINI_EFFORTS,
         "context": 1_000_000,
-        "description": "Флагманская модель с рассуждениями (thinking)",
+        "description": "Расширенные возможности рассуждения",
     },
     {
-        "id": "gemini/gemini-3.6-flash",
-        "name": "Gemini 3.6 Flash",
-        "short": "Gemini 3.6 Flash",
-        "variants": [],
+        "id": "gemini/gemini-3.8-flash",
+        "name": "Gemini 3.8 Flash",
+        "short": "3.8 Flash",
+        "variants": GEMINI_EFFORTS,
         "context": 1_000_000,
-        "description": "Быстрая универсальная модель",
+        "description": "All-around help (новейший быстрый Flash)",
+    },
+    {
+        "id": "gemini/gemini-3.5-flash-lite",
+        "name": "Gemini 3.5 Flash-Lite",
+        "short": "3.5 Flash-Lite",
+        "variants": GEMINI_EFFORTS,
+        "context": 1_000_000,
+        "description": "Самые быстрые ответы",
     },
     {
         "id": "gemini/gemini-image",
@@ -72,13 +90,14 @@ def extract_prompt_and_images(parts):
 class GeminiTurn:
     """One streaming request to Gemini Web2API (/v1/chat/completions)."""
 
-    def __init__(self, base_url, api_key, model, messages, workdir, on_change=None):
+    def __init__(self, base_url, api_key, model, messages, workdir, on_change=None, effort=None):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.messages = messages
         self.workdir = Path(workdir)
         self.on_change = on_change or (lambda: None)
+        self.effort = effort
         self.parts = OrderedDict()
         self.lock = threading.Lock()
         self.done = threading.Event()
@@ -149,6 +168,8 @@ class GeminiTurn:
             "messages": self.messages,
             "stream": True,
         }
+        if self.effort:
+            body["reasoning_effort"] = self.effort
         data = json.dumps(body).encode("utf-8")
 
         reasoning_text = ""
@@ -283,4 +304,14 @@ class GeminiRouter:
 
         # Model mapping: if model_id starts with gemini/, strip it
         raw_model = model_id.split("/", 1)[1] if "/" in model_id else model_id
-        return GeminiTurn(self.base_url, self.api_key, raw_model, messages, self.workdir, on_change)
+        if effort and effort in ("low", "medium", "high", "xhigh", "max"):
+            thinking_model = f"{raw_model}-thinking"
+            if not raw_model.endswith("-thinking") and thinking_model in (
+                "gemini-4-argon-thinking",
+                "gemini-3.1-pro-thinking",
+                "gemini-3.8-flash-thinking",
+                "gemini-3.5-flash-lite-thinking",
+                "gemini-3.6-flash-thinking",
+            ):
+                raw_model = thinking_model
+        return GeminiTurn(self.base_url, self.api_key, raw_model, messages, self.workdir, on_change, effort=effort)

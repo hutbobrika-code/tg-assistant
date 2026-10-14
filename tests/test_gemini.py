@@ -74,10 +74,12 @@ class GeminiClientTest(unittest.TestCase):
         cls.server.shutdown()
 
     def test_gemini_models_metadata(self):
-        self.assertTrue(len(GEMINI_MODELS) >= 3)
+        self.assertTrue(len(GEMINI_MODELS) >= 5)
         ids = [m["id"] for m in GEMINI_MODELS]
+        self.assertIn("gemini/gemini-4-argon", ids)
         self.assertIn("gemini/gemini-3.1-pro", ids)
-        self.assertIn("gemini/gemini-3.6-flash", ids)
+        self.assertIn("gemini/gemini-3.8-flash", ids)
+        self.assertIn("gemini/gemini-3.5-flash-lite", ids)
         self.assertIn("gemini/gemini-image", ids)
 
     def test_extract_prompt_and_images(self):
@@ -144,16 +146,19 @@ class GeminiFlowTest(FlowBase):
         md, kb = bot.models_view(self.chat)
         self.assertIn("Gemini", md)
         labels = [b["text"] for row in kb["inline_keyboard"] for b in row]
-        self.assertTrue(any("Gemini 3.1 Pro" in lbl for lbl in labels))
+        self.assertTrue(any("4 Argon" in lbl for lbl in labels))
+        self.assertTrue(any("3.8 Flash" in lbl for lbl in labels))
+        self.assertTrue(any("3.1 Pro" in lbl for lbl in labels))
+        self.assertTrue(any("3.5 Flash-Lite" in lbl for lbl in labels))
 
     def test_gemini_chat_execution(self):
-        self.chat.st["model"] = "gemini/gemini-3.1-pro"
+        self.chat.st["model"] = "gemini/gemini-4-argon"
         self.run_job("Напиши приветствие", mid=101)
 
         self.assertTrue(len(self.finals()) > 0)
         final_md = self.finals()[-1]
         self.assertIn("Привет! Это ответ от Gemini.", final_md)
-        self.assertIn("Gemini 3.1 Pro", final_md)
+        self.assertIn("4 Argon", final_md)
 
         # Check that conversation was saved in state
         gem_st = self.chat.st.get("gemini", {})

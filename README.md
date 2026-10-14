@@ -24,9 +24,12 @@ Muse Spark 1.3 в режиме xhigh. Работает в GitHub Actions, сер
 Модели:
 
 - **Gemini (через Google аккаунт)**:
-  - `Gemini 3.1 Pro` — флагманская модель с рассуждениями (thinking) и контекстом 1M токенов
-  - `Gemini 3.6 Flash` — сверхбыстрая модель для повседневных задач
-  - `Gemini Image` — генерация картинок (Nano Banana)
+  - `4 Argon` (`gemini-4-argon`) — сложные задачи (флагман Google Ultra/Advanced)
+  - `3.1 Pro` (`gemini-3.1-pro`) — расширенные возможности рассуждения
+  - `3.8 Flash` (`gemini-3.8-flash`) — all-around help, новейший быстрый Flash
+  - `3.5 Flash-Lite` (`gemini-3.5-flash-lite`) — самые быстрые ответы
+  - `Gemini Image` (`gemini-image`) — генерация картинок (Nano Banana)
+  - Уровни рассуждений: Низкий (быстрый), Средний (умеренный), Высокий (глубокий)
   - Куки аккаунта автоматически обновляются каждые 10 минут внутри GitHub Actions роутера (`zexadev/gemini-web2api-go`) и сохраняются в зашифрованном виде. Для первоначального подключения или смены аккаунта достаточно запустить `~/sync_gemini.sh`.
 
 - **Бесплатные модели OpenCode Zen**:

@@ -84,6 +84,7 @@ CLAUDE_MODELS = [
      "variants": [], "context": 200_000},
 ]
 DEFAULT_CLAUDE_MODEL = CLAUDE_MODELS[0]["id"]
+DEFAULT_GEMINI_MODEL = GEMINI_MODELS[0]["id"]
 CLAUDE_LIMITS = {}  # latest rate_limit_info from Claude Code
 
 # Telegram's AIActions set (made for AI bots). Custom emoji only render when the bot
