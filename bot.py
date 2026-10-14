@@ -21,6 +21,7 @@ from queue import Empty, Queue
 from urllib.parse import urlparse
 
 from cc import ClaudeCode
+from gemini import GEMINI_MODELS, GeminiRouter
 from oc import OpenCode, OpenCodeError
 from render import RICH_LIMIT, md_escape, md_to_html, prepare, split_long
 from tg import Telegram, log
@@ -48,6 +49,8 @@ CLAUDE_BIN = os.path.expanduser(os.environ.get("CLAUDE_BIN", "~/.local/bin/claud
 CLAUDE_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
 DEFAULT_MODEL = os.environ.get("OC_MODEL", "opencode/muse-spark-1.3-contributor-free")
 DEFAULT_EFFORT = os.environ.get("OC_EFFORT", "xhigh")
+GEMINI_URL = os.environ.get("GEMINI_URL", "http://127.0.0.1:8083/v1")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "sk-gemini-internal")
 WORKDIR = Path(os.path.expanduser(os.environ.get("OC_WORKDIR", str(BASE / "workspace")))).resolve()
 UPLOADS = WORKDIR / "uploads"
 TIMEOUT = int(os.environ.get("OC_TIMEOUT", "1800"))
@@ -56,6 +59,7 @@ STATE_FILE = BASE / "state.json"
 tg = Telegram(TOKEN)
 oc = OpenCode(OC_URL, OC_PASSWORD, WORKDIR)
 claude = ClaudeCode(CLAUDE_BIN, WORKDIR, CLAUDE_TOKEN)
+gemini = GeminiRouter(GEMINI_URL, GEMINI_API_KEY, WORKDIR)
 
 EFFORTS = {  # label, hint
     "minimal": ("Минимум", "мгновенно"),
@@ -65,7 +69,7 @@ EFFORTS = {  # label, hint
     "xhigh": ("Очень высокий", "глубоко: код и анализ"),
     "max": ("Максимум", "предельно тщательно, дольше всего"),
 }
-CLAUDE_ICON, OPENCODE_ICON = "✴️", "🔹"
+CLAUDE_ICON, OPENCODE_ICON, GEMINI_ICON = "✴️", "🔹", "♊"
 CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 CLAUDE_MODELS = [
     {"id": "claude/claude-opus-5-5", "name": "Claude Opus 5.5", "short": "Opus 5.5",
@@ -291,27 +295,37 @@ _models = {"at": 0, "list": []}
 
 
 def models():
-    """Claude models (when connected) first, then the free OpenCode ones."""
+    """Claude models first, then Gemini (if connected), then free OpenCode ones."""
     if time.time() - _models["at"] > 600 or not _models["list"]:
         try:
             _models["list"] = oc.models()
             _models["at"] = time.time()
         except OpenCodeError as e:
             log("models:", e)
-    return (CLAUDE_MODELS if claude.available() else []) + _models["list"]
+    gemini_list = GEMINI_MODELS if gemini.available() else []
+    return (CLAUDE_MODELS if claude.available() else []) + gemini_list + _models["list"]
 
 
 def model_info(model_id):
-    return next((m for m in models() + CLAUDE_MODELS if m["id"] == model_id),
+    return next((m for m in models() + CLAUDE_MODELS + GEMINI_MODELS if m["id"] == model_id),
                 {"id": model_id, "name": model_id.split("/")[-1], "variants": [], "context": None})
 
 
 def engine_of(model_id):
-    return "claude" if model_id.startswith("claude/") else "opencode"
+    if model_id.startswith("claude/"):
+        return "claude"
+    if model_id.startswith("gemini/"):
+        return "gemini"
+    return "opencode"
 
 
 def engine_icon(model_id):
-    return CLAUDE_ICON if engine_of(model_id) == "claude" else OPENCODE_ICON
+    eng = engine_of(model_id)
+    if eng == "claude":
+        return CLAUDE_ICON
+    if eng == "gemini":
+        return GEMINI_ICON
+    return OPENCODE_ICON
 
 
 def short_name(m):
@@ -1115,6 +1129,60 @@ class ClaudeRun(Run):
         return {"base": self.base, "sid": self.new_sid} if self.new_sid else None
 
 
+class GeminiRun(Run):
+    engine = "gemini"
+
+    def __init__(self, chat, job):
+        super().__init__(chat, job)
+        st = chat.st
+        self.turn = None
+        gem_st = st.setdefault("gemini", {})
+        self.dialog = gem_st.setdefault("messages", [])
+        if job.get("regen") and len(self.dialog) >= 2:
+            self.dialog.pop()
+            self.dialog.pop()
+
+    def start(self):
+        self.turn = gemini.start(self.job["parts"], self.model, self.effort,
+                                 dialog=list(self.dialog), on_change=self._on_change)
+
+    def _on_change(self):
+        if self.turn is not None and self.turn.done.is_set():
+            self.done.set()
+        self.changed()
+
+    def snapshot(self):
+        return self.turn.snapshot() if self.turn else []
+
+    def stop(self):
+        super().stop()
+        if self.turn:
+            self.turn.stop()
+
+    def finished(self, now):
+        return bool(self.turn and self.turn.done.is_set())
+
+    def settle(self):
+        if self.turn:
+            self.turn.done.wait(5)
+
+    def collect(self):
+        parts = self.snapshot()
+        err = self.error or (None if self.stopped or not self.turn else self.turn.error())
+        if not err and parts:
+            prompt_text = "\n\n".join(p["text"] for p in self.job["parts"] if p.get("type") == "text").strip()
+            assistant_text = "\n\n".join(p["text"] for p in parts if p.get("type") == "text").strip()
+            if prompt_text:
+                self.dialog.append({"role": "user", "content": prompt_text})
+            if assistant_text:
+                self.dialog.append({"role": "assistant", "content": assistant_text})
+            save_state()
+        return parts, err
+
+    def regen_info(self):
+        return {"gemini": True}
+
+
 def changed_files(since):
     return [p for mt, _, p in sorted(walk_files(), reverse=True) if mt >= since]
 
@@ -1163,6 +1231,14 @@ def execute(chat, job):
             react(chat.id, job.get("reply_to"))
             return
         run = ClaudeRun(chat, job)
+    elif engine_of(job["model"]) == "gemini":
+        if not gemini.available():
+            send_md(chat, f"🔑 **Gemini роутер недоступен.** Выберите бесплатную модель в /settings.",
+                    markup={"inline_keyboard": [[btn(f"{OPENCODE_ICON} Перейти на бесплатную модель", "fallback")]]},
+                    reply_to=job.get("reply_to"))
+            react(chat.id, job.get("reply_to"))
+            return
+        run = GeminiRun(chat, job)
     else:
         sid = opencode_session(chat, job)
         if sid is None:
@@ -1426,6 +1502,9 @@ def dialog_line(chat):
     title = None
     if engine_of(st["model"]) == "claude":
         title = (st.get("claude") or {}).get("title")
+    elif engine_of(st["model"]) == "gemini":
+        gem_msgs = (st.get("gemini") or {}).get("messages", [])
+        title = f"Диалог ({len(gem_msgs) // 2} сообщ.)" if gem_msgs else None
     else:
         try:
             sess = oc.session(st["session"]) if st.get("session") else None
@@ -1473,6 +1552,8 @@ def models_view(chat):
         lines.append(f"- {CLAUDE_ICON} **Claude** — по вашей подписке")
     else:
         lines.append(f"- {CLAUDE_ICON} **Claude** — не подключён")
+    if gemini.available():
+        lines.append(f"- {GEMINI_ICON} **Gemini** — через ваш Google аккаунт")
     lines.append(f"- {OPENCODE_ICON} **OpenCode** — бесплатные модели")
     rows = []
     for i, m in enumerate(models()):
@@ -1575,6 +1656,7 @@ def new_dialog(chat, edit_msg=None):
     chat.strip_answer_buttons()
     chat.st["session"] = None
     archive_claude(chat.st)
+    chat.st["gemini"] = {"messages": [], "title": None}
     chat.context = None
     chat.last_regen = None
     save_state()

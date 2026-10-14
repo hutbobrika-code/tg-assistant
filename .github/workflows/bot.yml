@@ -59,6 +59,10 @@ jobs:
           if [ -n "$STATE_KEY" ] && [ -f state/state.enc ]; then
             openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -salt -pass env:STATE_KEY -in state/state.enc -out state.json || true
           fi
+          mkdir -p data
+          if [ -n "$STATE_KEY" ] && [ -f state/gemini.db.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -salt -pass env:STATE_KEY -in state/gemini.db.enc -out data/gemini.db || true
+          fi
 
       - name: Запуск сервера OpenCode
         if: env.ENABLED == 'true'
@@ -66,6 +70,15 @@ jobs:
           $HOME/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4096 &
           timeout 60 bash -c 'until curl -s http://127.0.0.1:4096/ >/dev/null; do sleep 1; done'
           echo "OpenCode server ready!"
+
+      - name: Запуск Gemini Web2API роутера
+        if: env.ENABLED == 'true'
+        run: |
+          curl -fsSL -o gemini-web2api-go https://github.com/zexadev/gemini-web2api-go/releases/download/v4.22.0/gemini-web2api-go_v4.22.0_linux_amd64
+          chmod +x gemini-web2api-go
+          ./gemini-web2api-go --port 8083 --api-key sk-gemini-internal --db data/gemini.db &
+          timeout 30 bash -c 'until curl -s http://127.0.0.1:8083/ >/dev/null; do sleep 1; done'
+          echo "Gemini Web2API ready on :8083!"
 
       - name: Смена
         if: env.ENABLED == 'true'
@@ -78,20 +91,25 @@ jobs:
           ALLOWED_IDS: "8693081862"
           SHIFT_MINUTES: "300"
           OC_WORKDIR: "workspace"
+          GEMINI_URL: "http://127.0.0.1:8083/v1"
+          GEMINI_API_KEY: "sk-gemini-internal"
 
       - name: Сохранить историю
         if: always() && env.ENABLED == 'true'
         env:
           STATE_KEY: ${{ secrets.STATE_KEY }}
         run: |
+          mkdir -p state
           if [ -f state.json ] && [ -n "$STATE_KEY" ]; then
-            mkdir -p state
             openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt -pass env:STATE_KEY -in state.json -out state/state.enc
-            git config user.name "assistant-bot"
-            git config user.email "assistant-bot@users.noreply.github.com"
-            git add state/state.enc
-            git diff --staged --quiet || (git commit -m "история $(date -u '+%F %H:%M UTC')" && git pull --rebase && git push)
           fi
+          if [ -f data/gemini.db ] && [ -n "$STATE_KEY" ]; then
+            openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt -pass env:STATE_KEY -in data/gemini.db -out state/gemini.db.enc
+          fi
+          git config user.name "assistant-bot"
+          git config user.email "assistant-bot@users.noreply.github.com"
+          git add state/
+          git diff --staged --quiet || (git commit -m "история и сессии $(date -u '+%F %H:%M UTC')" && git pull --rebase && git push)
 
       - name: Следующая смена
         if: always() && env.ENABLED == 'true'

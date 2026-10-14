@@ -1,2 +1,9 @@
 __pycache__/
 *.tmp
+data/
+*.db
+*.sqlite
+*.log
+.env
+workspace/
+

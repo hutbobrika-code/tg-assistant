@@ -21,19 +21,16 @@ Muse Spark 1.3 в режиме xhigh. Работает в GitHub Actions, сер
 - `/model` - модель, режим размышлений (от ⚡ мгновенно до 🔴 максимум), интернет
 - `/new` - новый диалог
 
-Модели (все бесплатные):
+Модели:
 
-| модель | фото | PDF | режимы |
-|---|---|---|---|
-| Muse Spark 1.3 | да | да | minimal - xhigh |
-| Space Bunny | да | | low - max |
-| MiMo V2.6 Flash | да | | |
-| Ling 3.0 Flash | | | low - high |
-| Nemotron 3 Ultra | | | |
-| Big Pickle | | | |
+- **Gemini (через Google аккаунт)**:
+  - `Gemini 3.1 Pro` — флагманская модель с рассуждениями (thinking) и контекстом 1M токенов
+  - `Gemini 3.6 Flash` — сверхбыстрая модель для повседневных задач
+  - `Gemini Image` — генерация картинок (Nano Banana)
+  - Куки аккаунта автоматически обновляются каждые 10 минут внутри GitHub Actions роутера (`zexadev/gemini-web2api-go`) и сохраняются в зашифрованном виде. Для первоначального подключения или смены аккаунта достаточно запустить `~/sync_gemini.sh`.
 
-Muse Spark 1.3 бесплатна в обмен на то, что Meta может учить модели на
-переписке. Личное туда лучше не писать.
+- **Бесплатные модели OpenCode Zen**:
+  - `Muse Spark 1.3`, `Space Bunny`, `MiMo V2.6 Flash`, `Ling 3.0 Flash`, `Nemotron 3 Ultra`, `Big Pickle`
 
 ## Настройка
 
