@@ -93,6 +93,7 @@ jobs:
           OC_WORKDIR: "workspace"
           GEMINI_URL: "http://127.0.0.1:8083/v1"
           GEMINI_API_KEY: "sk-gemini-internal"
+          STATE_KEY: ${{ secrets.STATE_KEY }}
 
       - name: Сохранить историю
         if: always() && env.ENABLED == 'true'

@@ -9,6 +9,8 @@ import base64
 import json
 import os
 import re
+import sqlite3
+import subprocess
 import threading
 import time
 import urllib.error
@@ -87,6 +89,59 @@ def extract_prompt_and_images(parts):
     return prompt_text, images
 
 
+def reload_router_cookies(base_url, state_key=None):
+    """Hot-reload fresh cookies from state/gemini.db.enc into gemini-web2api-go router."""
+    try:
+        subprocess.run(["git", "pull", "--rebase"], timeout=20, capture_output=True)
+    except Exception as e:
+        log("git pull during cookie reload failed:", e)
+
+    enc_file = Path("state/gemini.db.enc")
+    if not enc_file.is_file():
+        return False
+
+    key = state_key or os.environ.get("STATE_KEY")
+    if not key:
+        return False
+
+    tmp_db = Path(f"/tmp/hotreload_gemini_{int(time.time() * 1000)}.db")
+    try:
+        cmd = ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "100000", "-salt",
+               "-pass", "env:STATE_KEY", "-in", str(enc_file), "-out", str(tmp_db)]
+        res = subprocess.run(cmd, env=dict(os.environ, STATE_KEY=key), capture_output=True)
+        if res.returncode != 0:
+            log("decrypt gemini.db for reload failed:", res.stderr)
+            return False
+
+        con = sqlite3.connect(str(tmp_db))
+        row = con.cursor().execute("SELECT cookie FROM accounts WHERE status='enabled' ORDER BY id DESC LIMIT 1").fetchone()
+        con.close()
+        if not row or not row[0]:
+            return False
+        cookie_str = row[0]
+
+        admin_base = re.sub(r"/v1/?$", "", base_url)
+        add_url = f"{admin_base}/admin/api/cookies"
+        data = json.dumps({"cookie": cookie_str}).encode("utf-8")
+        req = urllib.request.Request(
+            add_url,
+            data=data,
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            log("gemini router hot-reloaded fresh cookie:", resp.status)
+            return True
+    except Exception as e:
+        log("reload_router_cookies error:", e)
+        return False
+    finally:
+        if tmp_db.exists():
+            try:
+                tmp_db.unlink()
+            except OSError:
+                pass
+
+
 class GeminiTurn:
     """One streaming request to Gemini Web2API (/v1/chat/completions)."""
 
@@ -103,6 +158,7 @@ class GeminiTurn:
         self.done = threading.Event()
         self._error = None
         self._stopped = False
+        self._retried = False
         self._req = None
         self._resp = None
         self.context = 0
@@ -241,10 +297,23 @@ class GeminiTurn:
                             self.on_change()
 
         except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")[:600]
+            log("gemini http error:", e.code, err_body)
+            if not self._retried and e.code == 502 and ("cookie" in err_body or "SNlM0e" in err_body):
+                self._retried = True
+                log("gemini attempting hot-reload of fresh cookies from git/state...")
+                if reload_router_cookies(self.base_url):
+                    log("gemini retrying turn after hot-reload...")
+                    self._run()
+                    return
             if not self._stopped:
-                err_body = e.read().decode("utf-8", errors="replace")[:600]
-                self._error = f"Gemini HTTP {e.code}: {err_body}"
-                log("gemini http error:", e.code, err_body)
+                if "cookie" in err_body or "SNlM0e" in err_body:
+                    self._error = (
+                        "⚠️ Сессия Google Gemini устарела. Откройте https://gemini.google.com в браузере Firefox "
+                        "или запустите ~/sync_gemini.sh для синхронизации."
+                    )
+                else:
+                    self._error = f"Gemini HTTP {e.code}: {err_body}"
         except Exception as e:
             if not self._stopped:
                 self._error = f"Gemini connection error: {e}"

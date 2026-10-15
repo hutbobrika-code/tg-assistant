@@ -110,24 +110,13 @@ def update_database(cookie_str):
     cur = con.cursor()
     cur.executescript(SCHEMA)
 
-    cur.execute("SELECT id FROM accounts LIMIT 1")
-    row = cur.fetchone()
     now = int(time.time())
-
-    if row:
-        acc_id = row[0]
-        cur.execute(
-            "UPDATE accounts SET cookie = ?, status = 'enabled', last_error = '', fail_count = 0 WHERE id = ?",
-            (cookie_str, acc_id)
-        )
-        print(f"[+] Обновлены куки для аккаунта #{acc_id} в {DB_PATH}")
-    else:
-        cur.execute(
-            "INSERT INTO accounts (label, cookie, status, created_at) VALUES (?, ?, 'enabled', ?)",
-            ("Firefox Google Account", cookie_str, now)
-        )
-        print(f"[+] Добавлен новый аккаунт с куками в {DB_PATH}")
-
+    cur.execute("DELETE FROM accounts")
+    cur.execute(
+        "INSERT INTO accounts (id, label, cookie, status, created_at, last_used_at, last_ok_at) VALUES (1, ?, ?, 'enabled', ?, ?, ?)",
+        ("Firefox Google Account", cookie_str, now, now, now)
+    )
+    print(f"[+] Установлен свежий аккаунт #1 в {DB_PATH}")
     con.commit()
     con.close()
 
