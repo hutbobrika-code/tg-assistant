@@ -6,6 +6,7 @@ Provides an OpenAI-compatible streaming interface to Gemini models:
 - gemini-image (image generation via Nano Banana)
 """
 import base64
+import hashlib
 import json
 import os
 import re
@@ -332,6 +333,212 @@ class GeminiTurn:
             self.on_change()
 
 
+_XSRF_CACHE = {}
+
+
+def get_active_cookie(db_path="data/gemini.db"):
+    """Read current active Google session cookie from data/gemini.db or decrypted state."""
+    p = Path(db_path)
+    if p.is_file():
+        try:
+            con = sqlite3.connect(str(p))
+            row = con.execute("SELECT cookie FROM accounts WHERE status='enabled' ORDER BY id DESC LIMIT 1").fetchone()
+            con.close()
+            if row and row[0]:
+                return row[0]
+        except Exception as e:
+            log("get_active_cookie from db error:", e)
+
+    enc_file = Path("state/gemini.db.enc")
+    key = os.environ.get("STATE_KEY")
+    if not key:
+        key_file = Path(os.path.expanduser("~/.gemini_state_key"))
+        if key_file.is_file():
+            try:
+                content = key_file.read_text().strip()
+                if "STATE_KEY=" in content:
+                    key = content.split("STATE_KEY=", 1)[1].strip()
+                else:
+                    key = content
+            except Exception:
+                pass
+
+    if enc_file.is_file() and key:
+        tmp_db = Path(f"/tmp/read_gemini_{int(time.time() * 1000)}.db")
+        try:
+            cmd = ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "100000", "-salt",
+                   "-pass", f"pass:{key}", "-in", str(enc_file), "-out", str(tmp_db)]
+            res = subprocess.run(cmd, capture_output=True)
+            if res.returncode == 0:
+                con = sqlite3.connect(str(tmp_db))
+                row = con.execute("SELECT cookie FROM accounts WHERE status='enabled' ORDER BY id DESC LIMIT 1").fetchone()
+                con.close()
+                if row and row[0]:
+                    return row[0]
+        except Exception as e:
+            log("get_active_cookie decrypt error:", e)
+        finally:
+            if tmp_db.exists():
+                try:
+                    tmp_db.unlink()
+                except OSError:
+                    pass
+    return ""
+
+
+def get_xsrf_token(cookie_str=None):
+    """Retrieve or use cached SNlM0e token from gemini.google.com/app."""
+    global _XSRF_CACHE
+    cookie = cookie_str or get_active_cookie()
+    if not cookie:
+        raise RuntimeError("Нет сохранённых cookies для аккаунта Google Gemini")
+
+    now = time.time()
+    cached = _XSRF_CACHE.get(cookie[:20])
+    if cached and (now - cached.get("time", 0)) < 900:  # 15 minutes TTL
+        return cached["token"]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cookie": cookie,
+    }
+    req = urllib.request.Request("https://gemini.google.com/app", headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+            m = re.search(r'\"SNlM0e\":\"([^\"]+)\"', html)
+            if m:
+                token = m.group(1)
+                _XSRF_CACHE[cookie[:20]] = {"token": token, "time": now}
+                return token
+    except Exception as e:
+        log("get_xsrf_token error:", e)
+
+    if cached and cached.get("token"):
+        return cached["token"]
+    raise RuntimeError("Не удалось получить токен SNlM0e с gemini.google.com (возможно, сессия устарела)")
+
+
+def make_sapisid_hash(cookie_str):
+    m = re.search(r'(?:^|;\s*)SAPISID=([^;]+)', cookie_str)
+    sapisid = m.group(1) if m else ""
+    ts = int(time.time())
+    sig = hashlib.sha1(f"{ts} {sapisid} https://gemini.google.com".encode()).hexdigest()
+    return f"SAPISIDHASH {ts}_{sig}"
+
+
+def list_web_chats(cookie_str=None, limit=50):
+    """Fetch list of user's web chats from gemini.google.com."""
+    cookie = cookie_str or get_active_cookie()
+    if not cookie:
+        return []
+    try:
+        at = get_xsrf_token(cookie)
+        auth_header = make_sapisid_hash(cookie)
+        payload = json.dumps([[["MaZiqc", "[]", None, "generic"]]])
+        form = urllib.parse.urlencode({"f.req": payload, "at": at}).encode("utf-8")
+        req_id = int(time.time() * 1000) % 1000000
+        url = f"https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=MaZiqc&bl=boq_assistant-bard-web-server_20240901.00_p0&hl=ru&_reqid={req_id}&rt=c"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "Cookie": cookie,
+            "Authorization": auth_header,
+            "X-Same-Domain": "1",
+            "Origin": "https://gemini.google.com",
+            "Referer": "https://gemini.google.com/app",
+        }
+        req = urllib.request.Request(url, data=form, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+
+        out = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if "MaZiqc" in line and line.startswith("["):
+                try:
+                    for item in json.loads(line):
+                        if isinstance(item, list) and len(item) >= 3 and item[1] == "MaZiqc":
+                            inner = json.loads(item[2])
+                            entries = inner[2] if len(inner) > 2 and isinstance(inner[2], list) else (inner[0] if isinstance(inner[0], list) else [])
+                            for e in entries:
+                                if isinstance(e, list) and len(e) >= 2 and e[0]:
+                                    out.append({"id": e[0], "title": e[1] or "Без названия"})
+                except Exception:
+                    pass
+        return out[:limit]
+    except Exception as e:
+        log("list_web_chats error:", e)
+        return []
+
+
+def get_web_chat(conv_id, cookie_str=None):
+    """Fetch all messages from a specific Gemini web chat."""
+    cookie = cookie_str or get_active_cookie()
+    if not cookie:
+        return {"id": conv_id, "messages": []}
+    try:
+        at = get_xsrf_token(cookie)
+        auth_header = make_sapisid_hash(cookie)
+        inner_payload = json.dumps([conv_id, 30, None, 1, [0], [4], None, 1])
+        payload = json.dumps([[["hNvQHb", inner_payload, None, "generic"]]])
+        form = urllib.parse.urlencode({"f.req": payload, "at": at}).encode("utf-8")
+        req_id = int(time.time() * 1000) % 1000000
+        url = f"https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=hNvQHb&bl=boq_assistant-bard-web-server_20240901.00_p0&hl=ru&_reqid={req_id}&rt=c"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "Cookie": cookie,
+            "Authorization": auth_header,
+            "X-Same-Domain": "1",
+            "Origin": "https://gemini.google.com",
+            "Referer": "https://gemini.google.com/app",
+        }
+        req = urllib.request.Request(url, data=form, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+
+        messages = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if "hNvQHb" in line and line.startswith("["):
+                try:
+                    for item in json.loads(line):
+                        if isinstance(item, list) and len(item) >= 3 and item[1] == "hNvQHb":
+                            inner = json.loads(item[2])
+                            turns = inner[0] if isinstance(inner, list) and len(inner) > 0 and isinstance(inner[0], list) else []
+                            for turn in turns:
+                                u_text = ""
+                                try:
+                                    u_text = turn[2][0][0]
+                                except Exception:
+                                    pass
+                                if u_text:
+                                    messages.append({"role": "user", "content": u_text})
+
+                                a_text = ""
+                                try:
+                                    cands = turn[3]
+                                    if isinstance(cands, list) and len(cands) > 0 and isinstance(cands[0], list):
+                                        cand0 = cands[0]
+                                        if len(cand0) > 0 and isinstance(cand0[0], list) and len(cand0[0]) > 1:
+                                            parts = cand0[0][1]
+                                            if isinstance(parts, list):
+                                                a_text = "".join(p for p in parts if isinstance(p, str))
+                                except Exception:
+                                    pass
+                                if a_text:
+                                    messages.append({"role": "assistant", "content": a_text})
+                except Exception:
+                    pass
+        return {"id": conv_id, "messages": messages}
+    except Exception as e:
+        log("get_web_chat error:", e)
+        return {"id": conv_id, "messages": []}
+
+
 class GeminiRouter:
     """Manages connection to the local gemini-web2api-go instance."""
 
@@ -350,6 +557,12 @@ class GeminiRouter:
                 return resp.status == 200
         except Exception:
             return False
+
+    def list_web_chats(self, limit=50):
+        return list_web_chats(limit=limit)
+
+    def get_web_chat(self, conv_id):
+        return get_web_chat(conv_id)
 
     def start(self, parts, model_id, effort=None, dialog=None, on_change=None):
         prompt_text, images = extract_prompt_and_images(parts)

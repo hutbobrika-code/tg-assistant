@@ -169,3 +169,73 @@ class GeminiFlowTest(FlowBase):
         self.assertEqual(msgs[1]["role"], "assistant")
         self.assertEqual(msgs[1]["content"], "Привет! Это ответ от Gemini.")
 
+    def test_gemini_chats_view(self):
+        old_list = bot.gemini.list_web_chats
+        bot.gemini.list_web_chats = lambda limit=50: [
+            {"id": "c_1", "title": "Чат про математику"},
+            {"id": "c_2", "title": "Тестовый диалог"},
+        ]
+        try:
+            md, kb = bot.gemini_chats_view(self.chat, page=0)
+            self.assertIn("Чаты Gemini Web", md)
+            self.assertIn("artur.hodzhojan@gmail.com", md)
+            labels = [b["text"] for row in kb["inline_keyboard"] for b in row]
+            self.assertTrue(any("Чат про математику" in lbl for lbl in labels))
+            self.assertTrue(any("Тестовый диалог" in lbl for lbl in labels))
+        finally:
+            bot.gemini.list_web_chats = old_list
+
+    def test_gemini_open_web_chat_button(self):
+        old_list = bot.gemini.list_web_chats
+        old_get = bot.gemini.get_web_chat
+        bot.gemini.list_web_chats = lambda limit=50: [{"id": "c_geom", "title": "Геометрия"}]
+        bot.gemini.get_web_chat = lambda cid: {
+            "id": cid,
+            "messages": [
+                {"role": "user", "content": "Чему равна гипотенуза?"},
+                {"role": "assistant", "content": "По теореме Пифагора c = sqrt(a^2 + b^2)."}
+            ]
+        }
+        try:
+            toast = bot.on_button(self.chat, 501, "gw:o:c_geom")
+            self.assertIn("Загружен", toast)
+            st = self.chat.st
+            self.assertTrue(bot.engine_of(st["model"]) == "gemini")
+            gem_st = st.get("gemini", {})
+            self.assertEqual(gem_st["cid"], "c_geom")
+            self.assertEqual(gem_st["title"], "Геометрия")
+            self.assertEqual(len(gem_st["messages"]), 2)
+        finally:
+            bot.gemini.list_web_chats = old_list
+            bot.gemini.get_web_chat = old_get
+
+    def test_gemini_chat_continuation_with_history(self):
+        self.chat.st["model"] = "gemini/gemini-4-argon"
+        self.chat.st["gemini"] = {
+            "cid": "c_geom",
+            "title": "Геометрия",
+            "messages": [
+                {"role": "user", "content": "Чему равна гипотенуза?"},
+                {"role": "assistant", "content": "По теореме Пифагора c = sqrt(a^2 + b^2)."}
+            ]
+        }
+        self.run_job("А если катеты 3 и 4?", mid=102)
+        gem_st = self.chat.st.get("gemini", {})
+        msgs = gem_st.get("messages", [])
+        self.assertEqual(len(msgs), 4)
+        self.assertEqual(msgs[0]["content"], "Чему равна гипотенуза?")
+        self.assertEqual(msgs[2]["content"], "А если катеты 3 и 4?")
+        self.assertEqual(msgs[3]["role"], "assistant")
+        self.assertIn("Привет! Это ответ от Gemini.", msgs[3]["content"])
+
+    def test_gemini_sessions_view_has_web_chats_button(self):
+        self.chat.st["gemini"] = {
+            "cid": "c_geom",
+            "title": "Геометрия",
+            "messages": [{"role": "user", "content": "q"}]
+        }
+        md, kb = bot.sessions_view(self.chat)
+        all_datas = [b["callback_data"] for row in kb["inline_keyboard"] for b in row]
+        self.assertIn("gw:list", all_datas)
+        self.assertIn("gw:cur", all_datas)
+

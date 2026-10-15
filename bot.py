@@ -1180,6 +1180,10 @@ class GeminiRun(Run):
                 self.dialog.append({"role": "user", "content": prompt_text})
             if assistant_text:
                 self.dialog.append({"role": "assistant", "content": assistant_text})
+            gem_st = self.chat.st.setdefault("gemini", {})
+            gem_st["updated"] = time.time()
+            if not gem_st.get("title") and prompt_text:
+                gem_st["title"] = short(prompt_text, 40)
             save_state()
         return parts, err
 
@@ -1507,8 +1511,11 @@ def dialog_line(chat):
     if engine_of(st["model"]) == "claude":
         title = (st.get("claude") or {}).get("title")
     elif engine_of(st["model"]) == "gemini":
-        gem_msgs = (st.get("gemini") or {}).get("messages", [])
-        title = f"Диалог ({len(gem_msgs) // 2} сообщ.)" if gem_msgs else None
+        gem_st = st.get("gemini") or {}
+        title = gem_st.get("title")
+        gem_msgs = gem_st.get("messages", [])
+        if not title and gem_msgs:
+            title = f"Диалог ({len(gem_msgs) // 2} сообщ.)"
     else:
         try:
             sess = oc.session(st["session"]) if st.get("session") else None
@@ -1595,7 +1602,12 @@ def claude_dialogs(st):
 def sessions_view(chat):
     st = chat.st
     on_opencode = engine_of(st["model"]) == "opencode"
+    on_gemini = engine_of(st["model"]) == "gemini"
     items = [(u, f"{CLAUDE_ICON} {t}", d, c) for u, t, d, c in claude_dialogs(st)]
+    cur_gem = st.get("gemini") or {}
+    if cur_gem.get("title") or cur_gem.get("messages"):
+        items.append((cur_gem.get("updated", time.time()),
+                      f"{GEMINI_ICON} {cur_gem.get('title') or 'Диалог Gemini'}", "gw:cur", on_gemini))
     note = ""
     try:
         for s_ in oc.sessions():
@@ -1608,8 +1620,57 @@ def sessions_view(chat):
     items.sort(key=lambda x: -x[0])
     rows = [[btn(("✓ " if c else "") + short(t, 34) + " · " + ago(u), d, "primary" if c else None)]
             for u, t, d, c in items[:10]]
+    rows.append([btn("♊ Веб-чаты Gemini (Google)", "gw:list")])
     rows.append([btn("🆕 Новый диалог", "new"), btn("‹ Назад", "settings")])
     md = "## 🗂 Диалоги\n\n" + ("Выберите, чтобы продолжить:" if items else "Пока нет сохранённых диалогов.") + note
+    return md, {"inline_keyboard": rows}
+
+
+def gemini_chats_view(chat, page=0):
+    st = chat.st
+    chats = []
+    err_msg = ""
+    try:
+        chats = gemini.list_web_chats(limit=50)
+    except Exception as e:
+        err_msg = str(e)
+
+    cur_cid = (st.get("gemini") or {}).get("cid")
+    if not chats:
+        md = ("## ♊ Чаты Gemini Web (Google)\n\n"
+              "**Аккаунт:** `artur.hodzhojan@gmail.com`\n\n" +
+              (f"⚠️ Не удалось загрузить чаты: _{md_escape(err_msg)}_" if err_msg else "Чаты в веб-версии Gemini не найдены."))
+        rows = [[btn("🔄 Обновить", "gw:list")],
+                [btn("‹ К диалогам", "sessions"), btn("‹ В настройки", "settings")]]
+        return md, {"inline_keyboard": rows}
+
+    per_page = 6
+    total_pages = max(1, (len(chats) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    page_chats = chats[page * per_page:(page + 1) * per_page]
+
+    rows = []
+    for c in page_chats:
+        is_cur = c["id"] == cur_cid
+        txt = ("✓ " if is_cur else "") + "💬 " + short(c["title"], 32)
+        rows.append([btn(txt, f"gw:o:{c['id']}", "primary" if is_cur else None)])
+
+    nav = []
+    if page > 0:
+        nav.append(btn("« Назад", f"gw:p:{page - 1}"))
+    nav.append(btn(f"{page + 1}/{total_pages}", "gw:noop"))
+    if page < total_pages - 1:
+        nav.append(btn("Вперёд »", f"gw:p:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append([btn("🔄 Обновить", f"gw:p:{page}"), btn("🆕 Новый диалог", "new"), btn("‹ Назад", "sessions")])
+
+    cur_title = (st.get("gemini") or {}).get("title")
+    active_line = f"\n\n**Активный чат:** «{md_escape(cur_title)}»" if cur_title else ""
+    md = ("## ♊ Чаты Gemini Web (Google)\n"
+          "**Аккаунт:** `artur.hodzhojan@gmail.com`" + active_line + "\n\n"
+          "Выберите веб-чат, чтобы загрузить его историю и продолжить общение прямо в Telegram:")
     return md, {"inline_keyboard": rows}
 
 
@@ -1660,7 +1721,7 @@ def new_dialog(chat, edit_msg=None):
     chat.strip_answer_buttons()
     chat.st["session"] = None
     archive_claude(chat.st)
-    chat.st["gemini"] = {"messages": [], "title": None}
+    chat.st["gemini"] = {"messages": [], "title": None, "cid": None}
     chat.context = None
     chat.last_regen = None
     save_state()
@@ -1691,6 +1752,8 @@ def handle_command(chat, msg, text):
         send_md(chat, " ".join(parts))
     elif cmd in ("/settings", "/model", "/effort"):
         show_screen(chat, settings_view)
+    elif cmd in ("/chats", "/gemini_chats", "/gemini"):
+        show_screen(chat, lambda c: gemini_chats_view(c, 0))
     elif cmd == "/sessions":
         show_screen(chat, sessions_view)
     elif cmd == "/files":
@@ -2027,6 +2090,56 @@ def on_button(chat, mid, data):
         if engine_of(st["model"]) != "claude":
             use_model(st, (st.get("last_model") or {}).get("claude") or DEFAULT_CLAUDE_MODEL)
         switched_dialog(chat, mid, (st.get("claude") or {}).get("title"))
+    elif data == "gw:list":
+        show_screen(chat, lambda c: gemini_chats_view(c, 0), mid)
+    elif data.startswith("gw:p:"):
+        try:
+            p_idx = int(data.split(":")[2])
+        except (IndexError, ValueError):
+            p_idx = 0
+        show_screen(chat, lambda c: gemini_chats_view(c, p_idx), mid)
+    elif data == "gw:cur":
+        if engine_of(st["model"]) != "gemini":
+            use_model(st, (st.get("last_model") or {}).get("gemini") or "gemini/gemini-4-argon")
+        switched_dialog(chat, mid, (st.get("gemini") or {}).get("title"))
+    elif data.startswith("gw:o:"):
+        conv_id = data.split(":", 2)[2]
+        try:
+            res = gemini.get_web_chat(conv_id)
+            msgs = res.get("messages", [])
+            all_chats = gemini.list_web_chats(limit=50)
+            found_title = next((c["title"] for c in all_chats if c["id"] == conv_id), None)
+            if not found_title:
+                found_title = "Веб-чат Gemini"
+            if engine_of(st["model"]) != "gemini":
+                use_model(st, (st.get("last_model") or {}).get("gemini") or "gemini/gemini-4-argon")
+            st["gemini"] = {"cid": conv_id, "title": found_title, "messages": msgs, "updated": time.time()}
+            chat.context = None
+            chat.last_regen = None
+            chat.strip_answer_buttons()
+            save_state()
+            m = model_info(st["model"])
+            last_preview = ""
+            if msgs:
+                last_msg = msgs[-1]
+                role_name = "Gemini" if last_msg["role"] == "assistant" else "Вы"
+                last_preview = f"\n\n**Последнее сообщение ({role_name}):**\n_{md_escape(short(last_msg['content'], 180))}_"
+            loaded_text = (
+                f"💬 **Загружен веб-чат Gemini:**\n«{md_escape(found_title)}» · {len(msgs)} сообщ.\n"
+                f"Модель: {engine_icon(m['id'])} **{md_escape(short_name(m))}**{last_preview}\n\n"
+                "✍️ **Пишите вопрос прямо сюда** — бот продолжит диалог с полным контекстом!"
+            )
+            edit_md(chat, mid, loaded_text,
+                    {"inline_keyboard": [
+                        [btn("🆕 Новый диалог", "new"), btn("‹ Все веб-чаты", "gw:list")],
+                        [btn("⚙️ Настройки", "settings")],
+                    ]})
+            return f"Загружен: {short(found_title, 20)}"
+        except Exception as e:
+            log("open web chat error:", e)
+            return "Ошибка загрузки веб-чата"
+    elif data == "gw:noop":
+        return None
     elif data == "fallback":
         use_model(st, (st.get("last_model") or {}).get("opencode") or DEFAULT_MODEL)
         save_state()
@@ -2243,7 +2356,8 @@ def cookie_keeper_loop():
 def setup_profile():
     tg("setMyCommands", commands=[{"command": c, "description": d} for c, d in [
         ("new", "🆕 Новый диалог"), ("stop", "⏹ Остановить ответ"), ("settings", "⚙️ Модель и настройки"),
-        ("sessions", "🗂 Прошлые диалоги"), ("files", "📁 Файлы агента"), ("help", "❓ Как пользоваться"),
+        ("chats", "♊ Веб-чаты Gemini"), ("sessions", "🗂 Прошлые диалоги"), ("files", "📁 Файлы агента"),
+        ("help", "❓ Как пользоваться"),
     ]])
     desc = ("Агент OpenCode на модели Muse Spark 1.3: думает, пишет и запускает код, рисует графики, "
             "разбирает фото и файлы. Формулы и таблицы — прямо в чате.")
