@@ -396,11 +396,27 @@ class GeminiFlowTest(FlowBase):
         self.assertTrue(bot.handle_command(self.chat, {"message_id": 13}, "/image"))
         self.assertTrue(bot.handle_command(self.chat, {"message_id": 14}, "/deepresearch"))
 
-        # Test view renderers
+        # Test view renderers (fallback branch when no live network)
         md, kb = bot.limits_view(self.chat)
         self.assertIn("Лимиты на использование Gemini", md)
-        self.assertIn("Текущее использование", md)
         self.assertTrue(len(kb["inline_keyboard"]) >= 3)
+
+        # Test view with live/mocked web usage metrics
+        old_fetch = gemini.fetch_gemini_web_usage
+        gemini.fetch_gemini_web_usage = lambda **k: {
+            "tier": "PRO",
+            "current": {"percent": 97, "reset_time": "19:52"},
+            "weekly": {"percent": 16, "reset_time": "20 окт. в 10:52"},
+            "updated_at": "только что"
+        }
+        try:
+            md_web, _ = bot.limits_view(self.chat)
+            self.assertIn("Текущее использование", md_web)
+            self.assertIn("97 %", md_web)
+            self.assertIn("Недельный лимит", md_web)
+            self.assertIn("16 %", md_web)
+        finally:
+            gemini.fetch_gemini_web_usage = old_fetch
 
         # Test progress bar
         bar_97 = bot.make_progress_bar(97, 12)
