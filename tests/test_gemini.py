@@ -433,5 +433,46 @@ class GeminiFlowTest(FlowBase):
         md, kb = bot.deepresearch_guide_view(self.chat)
         self.assertIn("Deep Research", md)
 
+    def test_followup_extraction_and_cleaning(self):
+        sample_text = (
+            "Вот подробный план тренировок для набора массы...\n\n"
+            "<thought>Thinking about muscles...</thought>\n"
+            '<FollowUp label="Советы по питанию" query="Какие советы по питанию помогут быстрее набрать массу?"/>\n'
+            '<FollowUp label="Пример программы тренировок" query="Составь пример программы тренировок на 3 дня для набора массы."/>\n'
+            '<FollowUp label="Ошибки новичков" query="Какие частые ошибки совершают новички при наборе массы?"/>'
+        )
+        cleaned, fus = gemini.clean_gemini_text_and_extract_followups(sample_text)
+        self.assertEqual(len(fus), 3)
+        self.assertEqual(fus[0]["label"], "Советы по питанию")
+        self.assertEqual(fus[0]["query"], "Какие советы по питанию помогут быстрее набрать массу?")
+        self.assertNotIn("<FollowUp", cleaned)
+        self.assertNotIn("<thought>", cleaned)
+        self.assertIn("Вот подробный план тренировок для набора массы...", cleaned)
+
+    def test_followup_buttons_and_action(self):
+        fus = [{"label": "Советы по питанию", "query": "Подробнее о питании"}]
+        kb = bot.answer_keyboard([], followups=fus, chat=self.chat)
+        found_fu_btn = any("Советы по питанию" in btn_item.get("text", "") for row in kb["inline_keyboard"] for btn_item in row)
+        self.assertTrue(found_fu_btn)
+        note = bot.on_button(self.chat, 999, "do_fu:0")
+        self.assertIn("Запрос:", note)
+
+    def test_reply_menu_and_pending_mode(self):
+        self.chat.st.pop("pending_mode", None)
+        self.assertTrue(bot.handle_menu_button(self.chat, "🎨 Фото", {"message_id": 10}))
+        self.assertEqual(self.chat.st.get("pending_mode"), "image")
+
+        # Sending text in pending mode
+        bot.process_messages(self.chat, [{"message_id": 11, "text": "рыжий кот в очках"}])
+        self.assertIsNone(self.chat.st.get("pending_mode"))
+        self.assertEqual(self.chat.st.get("model"), "gemini/gemini-image")
+
+    def test_limits_view_no_water(self):
+        md, _ = bot.limits_view(self.chat)
+        self.assertNotIn("Параметры подключения", md)
+        self.assertNotIn("Cookie Pool", md)
+        self.assertNotIn("Квоты моделей", md)
+        self.assertNotIn("Статистика бота за 24 часа", md)
+
 
 

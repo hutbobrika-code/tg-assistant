@@ -7,6 +7,7 @@ Provides an OpenAI-compatible streaming interface to Gemini models:
 """
 import base64
 import hashlib
+import html
 import json
 import os
 import re
@@ -169,6 +170,45 @@ def reload_router_cookies(base_url, state_key=None):
                 pass
 
 
+def clean_gemini_text_and_extract_followups(text):
+    """
+    Extracts structured follow-ups from <FollowUp .../> tags and strips all XML artifacts
+    (<FollowUp>, <thought>, <citation>, etc.) so that clean human text remains.
+    """
+    followups = []
+    if not text:
+        return "", followups
+
+    # 1. Match and extract full FollowUp tags
+    fu_pattern = r'<FollowUp\b([^>]*?)(?:/>|>(.*?)</FollowUp>)'
+    for m in re.finditer(fu_pattern, text, flags=re.DOTALL | re.IGNORECASE):
+        attrs = m.group(1)
+        inner = (m.group(2) or "").strip()
+        label_m = re.search(r'label=["\'](.*?)["\']', attrs, flags=re.DOTALL | re.IGNORECASE)
+        query_m = re.search(r'query=["\'](.*?)["\']', attrs, flags=re.DOTALL | re.IGNORECASE)
+        label = (label_m.group(1) if label_m else inner).strip()
+        query = (query_m.group(1) if query_m else (inner if not label else label)).strip()
+        if not label and query:
+            label = query
+        if label or query:
+            label = html.unescape(label)
+            query = html.unescape(query)
+            followups.append({"label": label, "query": query})
+
+    # 2. Strip FollowUp tags
+    cleaned = re.sub(fu_pattern, "", text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<FollowUp\b[^>]*>?', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'</FollowUp>', '', cleaned, flags=re.IGNORECASE)
+
+    # 3. Strip any leaked internal XML tags: <thought>...</thought>, <citation...>, etc.
+    cleaned = re.sub(r'<thought\b[^>]*>.*?</thought>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'</?(?:thought|suggestion|citation|sources)\b[^>]*>', '', cleaned, flags=re.IGNORECASE)
+
+    # 4. Clean extra newlines
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+    return cleaned, followups
+
+
 class GeminiTurn:
     """One streaming request to Gemini Web2API (/v1/chat/completions)."""
 
@@ -183,6 +223,7 @@ class GeminiTurn:
         self.parts = OrderedDict()
         self.lock = threading.Lock()
         self.done = threading.Event()
+        self.followups = []
         self._error = None
         self._stopped = False
         self._retried = False
@@ -193,7 +234,13 @@ class GeminiTurn:
 
     def snapshot(self):
         with self.lock:
-            return [json.loads(json.dumps(p)) for p in self.parts.values()]
+            out = []
+            for p in self.parts.values():
+                d = json.loads(json.dumps(p))
+                if d.get("type") == "text" and "<FollowUp" in d.get("text", ""):
+                    d["text"] = re.sub(r'<FollowUp\b.*$', '', d["text"], flags=re.DOTALL | re.IGNORECASE).rstrip()
+                out.append(d)
+            return out
 
     def error(self):
         return self._error
@@ -515,6 +562,11 @@ class GeminiTurn:
                     # Post-process media tags
                     self.parts["t1"]["text"] = self._save_data_media(self.parts["t1"]["text"])
                     self.parts["t1"]["text"] = self._resolve_google_media(self.parts["t1"]["text"])
+                    # Post-process FollowUp tags and XML artifacts
+                    cleaned_txt, fu = clean_gemini_text_and_extract_followups(self.parts["t1"]["text"])
+                    self.parts["t1"]["text"] = cleaned_txt
+                    if fu:
+                        self.followups.extend(fu)
             self.done.set()
             self.on_change()
 

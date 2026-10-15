@@ -656,6 +656,15 @@ RUNS_LOCK = threading.Lock()
 
 SPINNER = ("◐", "◓", "◑", "◒")
 STOP_KB = {"inline_keyboard": [[{"text": "⏹ Остановить", "callback_data": "stop"}]]}
+MAIN_REPLY_KEYBOARD = {
+    "keyboard": [
+        [{"text": "🎨 Фото"}, {"text": "🎬 Видео"}, {"text": "🎵 Музыка"}],
+        [{"text": "🔬 Исследование"}, {"text": "📊 Лимиты"}, {"text": "♊ Чаты"}],
+        [{"text": "⚙️ Настройки"}, {"text": "🆕 Новый диалог"}],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
 
 
 class LiveMessage:
@@ -750,6 +759,7 @@ class Run:
         self.error = None
         self.retry = None
         self.live = None
+        self.followups = []
 
     @property
     def stopped(self):
@@ -902,7 +912,8 @@ class Run:
         prepared = [prepare(c, WORKDIR, upload=True) for c in chunks]
         embedded = {p for _, media in prepared for _, _, p in media}
         files = [f for f in changed_files(self.started - 1) if f not in embedded][:6]
-        markup = answer_keyboard(files)
+        followups = getattr(self, "followups", [])
+        markup = answer_keyboard(files, followups=followups, chat=chat)
         if isinstance(err, str) and err.startswith(("🔑", "⏳")):
             markup["inline_keyboard"].append([btn(f"{OPENCODE_ICON} Перейти на бесплатную модель", "fallback")])
 
@@ -1187,6 +1198,8 @@ class GeminiRun(Run):
     def collect(self):
         parts = self.snapshot()
         err = self.error or (None if self.stopped or not self.turn else self.turn.error())
+        if self.turn and hasattr(self.turn, "followups"):
+            self.followups = list(self.turn.followups)
         if not err and parts:
             prompt_text = "\n\n".join(p["text"] for p in self.job["parts"] if p.get("type") == "text").strip()
             assistant_text = "\n\n".join(p["text"] for p in parts if p.get("type") == "text").strip()
@@ -1209,8 +1222,14 @@ def changed_files(since):
     return [p for mt, _, p in sorted(walk_files(), reverse=True) if mt >= since]
 
 
-def answer_keyboard(files):
-    rows = [[btn("🔁 Ещё раз", "regen"), btn("🆕 Новый диалог", "new")]]
+def answer_keyboard(files, followups=None, chat=None):
+    rows = []
+    if followups and chat is not None:
+        chat.st["last_followups"] = followups[:3]
+        for idx, fu in enumerate(followups[:3]):
+            label = fu.get("label") or fu.get("query") or ""
+            rows.append([btn(f"💡 {short(label, 36)}", f"do_fu:{idx}")])
+    rows.append([btn("🔁 Ещё раз", "regen"), btn("🆕 Новый диалог", "new")])
     fb = [btn(f"📎 {short(p.name, 26)}", f"f:{file_token(p)}") for p in files]
     rows += [fb[i:i + 2] for i in range(0, len(fb), 2)]
     return {"inline_keyboard": rows}
@@ -1475,25 +1494,24 @@ def welcome_md(chat):
         f"# 👋 Привет!\n\n"
         f"## 🚀 **Google Gemini AI & Telegram Assistant**\n\n"
         f"Текущая модель: **{engine_icon(m['id'])} {md_escape(short_name(m))}**\n\n"
-        "Пишите обычным текстом или используйте выделенные команды:\n"
-        "- 🎬 `/video [сцена]` — кинематографичные видео высокого качества (**Google Veo 2**)\n"
-        "- 🎵 `/music [стиль]` — генерация треков и музыки (**Google Lyria 3.5**)\n"
-        "- 🎨 `/image [промпт]` — генерация изображений (**Nano Banana / Imagen**)\n"
-        "- 🔬 `/deepresearch [тема]` — глубокий исследовательский отчёт (**4 Argon Thinking**)\n"
-        "- 📊 `/limits` — квоты, лимиты и статистика вашего аккаунта Google One AI Premium\n"
-        "- 💬 `/chats` — синхронизация и продолжение диалогов из Gemini Web\n"
-        "- 🧮 Формулы, графики, таблицы, чтение PDF, фото и документов\n"
+        "Общайтесь с Gemini обычным текстом или используйте кнопки быстрого запуска:\n"
+        "- 🎨 **Фото** — генерация изображений (**Nano Banana / Imagen**)\n"
+        "- 🎬 **Видео** — кинематографичные ролики (**Google Veo 2**)\n"
+        "- 🎵 **Музыка** — синтез аудиотреков (**Google Lyria 3.5**)\n"
+        "- 🔬 **Deep Research** — глубокие исследовательские отчёты (**4 Argon Thinking**)\n"
+        "- 📊 **Лимиты** — 5-часовые и недельные квоты вашего аккаунта\n"
+        "- 💬 **Чаты** — синхронизация диалогов с веб-версией Gemini\n"
+        "- 🧮 Формулы, графики, таблицы, анализ PDF, документов и изображений\n"
         + claude_line +
-        "\n**Быстрый старт:**"
+        "\n_Для быстрого доступа используйте кнопки клавиатуры внизу экрана._"
     )
 
 
 def welcome_kb():
     return {"inline_keyboard": [
-        [btn("🎨 Сгенерировать фото", "prompt_guide:img"), btn("🎬 Создать видео", "prompt_guide:vid")],
-        [btn("🎵 Создать музыку", "prompt_guide:mus"), btn("🔬 Deep Research", "prompt_guide:dr")],
-        [btn("📊 Лимиты Gemini", "limits"), btn("💬 Веб-чаты", "gw:list")],
-        [btn("⚙️ Настройки", "settings"), btn("❓ Помощь", "help")],
+        [btn("🎨 Фото", "prompt_guide:img"), btn("🎬 Видео", "prompt_guide:vid"), btn("🎵 Музыка", "prompt_guide:mus")],
+        [btn("🔬 Deep Research", "prompt_guide:dr"), btn("📊 Лимиты", "limits"), btn("💬 Веб-чаты", "gw:list")],
+        [btn("⚙️ Настройки", "settings"), btn("🆕 Новый диалог", "new")],
     ]}
 
 
@@ -1598,12 +1616,7 @@ def limits_view(chat):
     info = gemini.get_limits_info()
     web = info.get("web_limits")
 
-    email = info.get("email", "artur.hodzhojan@gmail.com")
     tier_label = web.get("tier", "PRO") if web else "PRO"
-    plan = info.get("plan", f"Google One AI Premium ({tier_label})")
-    status = "🟢 Онлайн (Активен)" if info.get("account_status") == "enabled" else "⚠️ Требует проверки"
-    cookies_str = f"12/12 ({info.get('cookie_health', 'ok')})"
-    last_ok = ago(info["last_ok_at"]) if info.get("last_ok_at") else "недавно"
 
     lines = [
         f"## 📊 Лимиты на использование Gemini · `{tier_label}`",
@@ -1614,64 +1627,38 @@ def limits_view(chat):
     if web:
         cur = web.get("current") or {}
         wk = web.get("weekly") or {}
-        c_pct = cur.get("percent")
+        c_pct = cur.get("percent", 0)
         c_reset = cur.get("reset_time", "—")
-        w_pct = wk.get("percent")
+        w_pct = wk.get("percent", 0)
         w_reset = wk.get("reset_time", "—")
 
         c_bar = make_progress_bar(c_pct, 12)
         w_bar = make_progress_bar(w_pct, 12)
 
         lines.extend([
-            f"### ⏱ Текущее использование: **Использовано {c_pct} %**",
+            f"### ⏱ Текущее использование (5 ч): **Использовано {c_pct} %**",
             f"`[{c_bar}] {c_pct}%`",
             f"> ⏳ _Лимит обновится в {c_reset}_",
             "",
             f"### 📅 Недельный лимит: **Использовано {w_pct} %**",
             f"`[{w_bar}] {w_pct}%`",
             f"> ⏳ _Лимит обновится {w_reset}_",
-            "",
         ])
     else:
         lines.extend([
-            "> ⚠️ _Данные официальных лимитов обновляются..._",
+            "### ⏱ Текущее использование (5 ч)",
+            "`[░░░░░░░░░░░░] 0%`",
+            "> ⏳ _Лимит доступен в полном объёме_",
             "",
+            "### 📅 Недельный лимит",
+            "`[░░░░░░░░░░░░] 0%`",
+            "> ⏳ _Лимит доступен в полном объёме_",
         ])
-
-    reqs = info.get("requests_24h", 0)
-    succ = info.get("success_24h", 0)
-    rate = f"{round((succ / reqs) * 100)}%" if reqs > 0 else "100%"
-    avg_s = f"{info.get('avg_ms_24h', 0)} с" if info.get("avg_ms_24h") else "—"
-
-    lines.extend([
-        "### ⚙️ Параметры подключения:",
-        f"- 👤 **Аккаунт:** `{email}`",
-        f"- 💎 **Тариф:** {plan}",
-        f"- ⚡ **Сессия:** {status}",
-        f"- 🛡 **Cookie Pool:** {cookies_str} · {last_ok}",
-        f"- 🔄 **Авто-ротация:** каждые 10 мин (GitHub Actions Runner)",
-        "",
-        "### ♊ Квоты моделей Gemini:",
-    ])
-    for q in info.get("quotas", []):
-        lines.append(f"- {q['status']} **{q['model']}** — `{q['quota']}`")
-
-    lines.extend([
-        "",
-        "### 📈 Статистика бота за 24 часа:",
-        f"- Всего запросов: **{reqs}** (успешных: **{succ}** · {rate})",
-        f"- Среднее время ответа (TTFB): **{avg_s}**",
-    ])
-    by_m = info.get("by_model", {})
-    if by_m:
-        m_lines = [f"  • `{m}`: {data['total']} зап. ({data['success']} OK)" for m, data in by_m.items()]
-        lines.append("- По моделям:\n" + "\n".join(m_lines))
 
     md = "\n".join(lines)
     rows = [
-        [btn("🔄 Обновить лимиты", "limits"), btn("⚙️ Модели", "models")],
-        [btn("🎨 Сгенерировать фото", "prompt_guide:img"), btn("🎬 Создать видео", "prompt_guide:vid")],
-        [btn("🎵 Создать музыку", "prompt_guide:mus"), btn("🔬 Deep Research", "prompt_guide:dr")],
+        [btn("🔄 Обновить лимиты", "limits")],
+        [btn("🤖 Модели", "models")],
         [btn("‹ В настройки", "settings"), btn("✖️ Закрыть", "close")],
     ]
     return md, {"inline_keyboard": rows}
@@ -1705,49 +1692,49 @@ DR_SAMPLES = [
 def image_guide_view(chat):
     md = (
         "## 🎨 Генерация изображений (Gemini Imagen)\n\n"
-        "Отправьте команду: `/image <описание картинки>` (или `/draw`, `/img`).\n\n"
-        "Нейросеть Nano Banana / Imagen создаст качественную иллюстрацию и пришлёт её прямо в чат.\n\n"
-        "**Быстрые примеры:**"
+        "✨ **Напишите в ответ любое описание** того, что хотите увидеть, "
+        "или нажмите на один из быстрых примеров ниже:\n\n"
+        "Нейросеть Nano Banana / Imagen создаст качественную иллюстрацию и пришлёт её прямо в чат."
     )
     rows = [[btn(label, f"do_prompt:img:{i}")] for i, (label, _) in enumerate(IMG_SAMPLES)]
-    rows.append([btn("‹ В меню", "settings"), btn("✖️ Закрыть", "close")])
+    rows.append([btn("‹ В настройки", "settings"), btn("✖️ Отмена", "cancel_pending")])
     return md, {"inline_keyboard": rows}
 
 
 def video_guide_view(chat):
     md = (
         "## 🎬 Генерация видео (Google Veo 2)\n\n"
-        "Отправьте команду: `/video <описание сцены>` (или `/veo`).\n\n"
-        "Кинематографичная модель **Veo 2** сгенерирует плавный видеоролик в MP4 и отправит его вам как нативное видео в Telegram.\n\n"
-        "⏱ *Время генерации обычно занимает от 1 до 2 минут.*\n\n"
-        "**Быстрые примеры:**"
+        "✨ **Напишите в ответ описание сцены** для создания видео, "
+        "или нажмите на один из готовых кинематографичных примеров:\n\n"
+        "Кинематографичная модель **Google Veo 2** сгенерирует плавный видеоролик в MP4 и отправит его вам как нативное видео в Telegram.\n\n"
+        "⏱ *Время генерации обычно занимает от 1 до 2 минут.*"
     )
     rows = [[btn(label, f"do_prompt:vid:{i}")] for i, (label, _) in enumerate(VID_SAMPLES)]
-    rows.append([btn("‹ В меню", "settings"), btn("✖️ Закрыть", "close")])
+    rows.append([btn("‹ В настройки", "settings"), btn("✖️ Отмена", "cancel_pending")])
     return md, {"inline_keyboard": rows}
 
 
 def music_guide_view(chat):
     md = (
         "## 🎵 Генерация музыки (Google Lyria 3.5)\n\n"
-        "Отправьте команду: `/music <стиль или описание трека>` (или `/audio`, `/track`).\n\n"
-        "Модель **Lyria 3.5** синтезирует полноценный аудиотрек и отправит его в Telegram.\n\n"
-        "**Быстрые примеры:**"
+        "✨ **Напишите в ответ жанр, настроение или описание трека**, "
+        "или выберите один из музыкальных стилей ниже:\n\n"
+        "Модель **Google Lyria 3.5** синтезирует полноценный аудиотрек и отправит его в Telegram."
     )
     rows = [[btn(label, f"do_prompt:mus:{i}")] for i, (label, _) in enumerate(MUS_SAMPLES)]
-    rows.append([btn("‹ В меню", "settings"), btn("✖️ Закрыть", "close")])
+    rows.append([btn("‹ В настройки", "settings"), btn("✖️ Отмена", "cancel_pending")])
     return md, {"inline_keyboard": rows}
 
 
 def deepresearch_guide_view(chat):
     md = (
         "## 🔬 Gemini Deep Research (Глубокое исследование)\n\n"
-        "Отправьте команду: `/deepresearch <тема исследования>` (или `/research`).\n\n"
-        "Флагман **Gemini 4 Argon** с максимальной глубиной рассуждений проведёт структурированный всесторонний анализ темы с фактами, таблицами и выводами.\n\n"
-        "**Примеры исследовательских тем:**"
+        "✨ **Напишите в ответ тему для комплексного анализа**, "
+        "или выберите тему из готовых примеров ниже:\n\n"
+        "Флагман **Gemini 4 Argon** с максимальной глубиной рассуждений проведёт структурированный всесторонний анализ темы с фактами, таблицами и выводами."
     )
     rows = [[btn(label, f"do_prompt:dr:{i}")] for i, (label, _) in enumerate(DR_SAMPLES)]
-    rows.append([btn("‹ В меню", "settings"), btn("✖️ Закрыть", "close")])
+    rows.append([btn("‹ В настройки", "settings"), btn("✖️ Отмена", "cancel_pending")])
     return md, {"inline_keyboard": rows}
 
 
@@ -1935,12 +1922,13 @@ def new_dialog(chat, edit_msg=None):
     chat.st["gemini"] = {"messages": [], "title": None, "cid": None}
     chat.context = None
     chat.last_regen = None
+    chat.st.pop("pending_mode", None)
     save_state()
     md = "🆕 **Новый диалог.** Контекст очищен — пишите."
     if edit_msg:
         edit_md(chat, edit_msg, md)
     else:
-        send_md(chat, md)
+        send_md(chat, md, markup=MAIN_REPLY_KEYBOARD)
 
 
 # ---------- incoming updates ----------
@@ -1950,6 +1938,7 @@ def handle_command(chat, msg, text):
     cmd = cmd.split("@")[0].lower()
     arg = arg.strip()
     if cmd == "/start":
+        tg("sendMessage", chat_id=chat.id, text="⚡ Быстрое меню клавиатуры активировано:", reply_markup=MAIN_REPLY_KEYBOARD)
         send_md(chat, welcome_md(chat), welcome_kb())
     elif cmd == "/help":
         send_md(chat, HELP_MD)
@@ -2044,12 +2033,57 @@ def file_part(path, mime):
     return None
 
 
+def handle_menu_button(chat, text, msg):
+    t = text.strip()
+    if t in ("🎨 Фото", "Фото", "🎨 Сгенерировать фото"):
+        chat.st["pending_mode"] = "image"
+        show_screen(chat, image_guide_view)
+        return True
+    if t in ("🎬 Видео", "Видео", "🎬 Создать видео"):
+        chat.st["pending_mode"] = "video"
+        show_screen(chat, video_guide_view)
+        return True
+    if t in ("🎵 Музыка", "Музыка", "🎵 Создать музыку"):
+        chat.st["pending_mode"] = "music"
+        show_screen(chat, music_guide_view)
+        return True
+    if t in ("🔬 Исследование", "Исследование", "🔬 Deep Research"):
+        chat.st["pending_mode"] = "deepresearch"
+        show_screen(chat, deepresearch_guide_view)
+        return True
+    if t in ("📊 Лимиты", "Лимиты", "📊 Лимиты Gemini"):
+        chat.st.pop("pending_mode", None)
+        if gemini.available():
+            try:
+                gemini.get_limits_info(force_web=True)
+            except Exception:
+                pass
+        show_screen(chat, limits_view)
+        return True
+    if t in ("♊ Чаты", "Чаты", "💬 Веб-чаты", "Веб-чаты"):
+        chat.st.pop("pending_mode", None)
+        show_screen(chat, lambda c: gemini_chats_view(c, 0))
+        return True
+    if t in ("⚙️ Настройки", "Настройки", "🤖 Модели"):
+        chat.st.pop("pending_mode", None)
+        show_screen(chat, settings_view)
+        return True
+    if t in ("🆕 Новый диалог", "Новый диалог"):
+        chat.st.pop("pending_mode", None)
+        new_dialog(chat)
+        return True
+    return False
+
+
 def process_messages(chat, msgs):
     first = msgs[0]
     text = "\n".join(m.get("text") or m.get("caption") or "" for m in msgs).strip()
     has_media = any(k in m for m in msgs for k in MEDIA_KEYS)
-    if len(msgs) == 1 and text.startswith("/") and not has_media and handle_command(chat, first, text):
-        return
+    if len(msgs) == 1 and not has_media:
+        if text.startswith("/") and handle_command(chat, first, text):
+            return
+        if handle_menu_button(chat, text, first):
+            return
     if chat.question and text and not has_media:
         answer_question(chat, [text])
         react(chat.id, first["message_id"], "👌")
@@ -2086,6 +2120,36 @@ def process_messages(chat, msgs):
         body = "> " + short(quote, 1500).replace("\n", "\n> ") + "\n\n" + body
     if notes:
         body += "\n\n" + "\n".join(notes)
+
+    # Check for pending modal actions triggered by menu buttons
+    pending = chat.st.pop("pending_mode", None)
+    if pending == "image" and body:
+        use_model(chat.st, "gemini/gemini-image")
+        echo = send_md(chat, f"🎨 **Генерация фото:** _{md_escape(body)}_", reply_to=first["message_id"])
+        chat.enqueue({"parts": [{"type": "text", "text": body}], "reply_to": echo or first["message_id"]})
+        return
+    elif pending == "video" and body:
+        use_model(chat.st, "gemini/gemini-video")
+        echo = send_md(chat, f"🎬 **Генерация видео (Veo 2):** _{md_escape(body)}_", reply_to=first["message_id"])
+        chat.enqueue({"parts": [{"type": "text", "text": body}], "reply_to": echo or first["message_id"]})
+        return
+    elif pending == "music" and body:
+        use_model(chat.st, "gemini/gemini-music")
+        echo = send_md(chat, f"🎵 **Генерация музыки (Lyria):** _{md_escape(body)}_", reply_to=first["message_id"])
+        chat.enqueue({"parts": [{"type": "text", "text": body}], "reply_to": echo or first["message_id"]})
+        return
+    elif pending == "deepresearch" and body:
+        use_model(chat.st, "gemini/gemini-deep-research")
+        dr_text = (
+            "🔬 [DEEP RESEARCH MODE: Comprehensive Research Report]\n"
+            f"Проведи глубокое, всестороннее исследование по теме:\n\n{body}\n\n"
+            "Структурируй детальный фактологический отчёт: Резюме (Executive Summary), "
+            "Ключевые аспекты и механизмы, Сравнительный анализ, Факты и ссылки, Перспективы и выводы."
+        )
+        echo = send_md(chat, f"🔬 **Deep Research:** _{md_escape(short(body, 60))}_", reply_to=first["message_id"])
+        chat.enqueue({"parts": [{"type": "text", "text": dr_text}], "reply_to": echo or first["message_id"]})
+        return
+
     parts.insert(0, {"type": "text", "text": body})
     chat.enqueue({"parts": parts, "reply_to": first["message_id"]})
 
@@ -2315,6 +2379,22 @@ def on_button(chat, mid, data):
             echo = send_md(chat, f"🔬 **Deep Research:** _{md_escape(DR_SAMPLES[idx][0])}_\n_{md_escape(topic)}_")
             chat.enqueue({"parts": [{"type": "text", "text": dr_text}], "reply_to": echo})
             return "Запущен Deep Research"
+    elif data.startswith("do_fu:"):
+        idx = int(data.split(":")[1])
+        fu_list = chat.st.get("last_followups") or []
+        if 0 <= idx < len(fu_list):
+            fu = fu_list[idx]
+            query = fu.get("query") or fu.get("label") or ""
+            label = fu.get("label") or query
+            if query:
+                echo = send_md(chat, f"💡 **{md_escape(label)}**")
+                chat.enqueue({"parts": [{"type": "text", "text": query}], "reply_to": echo or mid})
+                return f"Запрос: {short(label, 20)}"
+        return "Предложение устарело"
+    elif data == "cancel_pending":
+        chat.st.pop("pending_mode", None)
+        tg("deleteMessage", chat_id=chat.id, message_id=mid)
+        return "Отменено"
     elif data == "models":
         show_screen(chat, models_view, mid)
     elif data == "sessions":
