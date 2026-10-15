@@ -339,4 +339,76 @@ class GeminiFlowTest(FlowBase):
                     gemini.get_web_chat = old_get
                     gemini.download_web_image = old_dl
 
+    def test_save_data_audio_and_video(self):
+        with tempfile.TemporaryDirectory() as td:
+            turn = gemini.GeminiTurn("http://127.0.0.1:9999", "k", "m", [], td)
+            b64_audio = "AAAA"
+            b64_video = "VVVV"
+            raw = f"Вот музыка: data:audio/mp3;base64,{b64_audio} и видео: data:video/mp4;base64,{b64_video}"
+            res = turn._save_data_media(raw)
+            self.assertIn("![Сгенерированная музыка](uploads/gemini_audio_", res)
+            self.assertIn("![Сгенерированное видео](uploads/gemini_video_", res)
+            self.assertNotIn("data:audio/mp3", res)
+            self.assertNotIn("data:video/mp4", res)
+
+    def test_resolve_google_media_audio(self):
+        with tempfile.TemporaryDirectory() as td:
+            turn = gemini.GeminiTurn("http://127.0.0.1:9999", "k", "m", [], td)
+            old_list = gemini.list_web_chats
+            old_get = gemini.get_web_chat
+            old_dl = gemini.download_web_image
+
+            with tempfile.NamedTemporaryFile(suffix=".m4a") as tmp_audio:
+                tmp_audio.write(b"fake audio stream")
+                tmp_audio.flush()
+
+                gemini.list_web_chats = lambda *a, **k: [{"id": "c_mus", "title": "Музыка"}]
+                gemini.get_web_chat = lambda *a, **k: {
+                    "id": "c_mus",
+                    "messages": [
+                        {"role": "assistant", "images": ["https://lh3.googleusercontent.com/gg/fake_music=m140"]}
+                    ]
+                }
+                gemini.download_web_image = lambda *a, **k: Path(tmp_audio.name)
+
+                try:
+                    raw = "Вот музыка:\n\nhttp://googleusercontent.com/generated_music_content/0"
+                    res = turn._resolve_google_media(raw)
+                    self.assertIn("![Сгенерированная музыка](uploads/", res)
+                    self.assertNotIn("generated_music_content", res)
+                finally:
+                    gemini.list_web_chats = old_list
+                    gemini.get_web_chat = old_get
+                    gemini.download_web_image = old_dl
+
+    def test_limits_info(self):
+        info = gemini.get_gemini_limits_info()
+        self.assertIn("email", info)
+        self.assertIn("plan", info)
+        self.assertIn("quotas", info)
+        self.assertTrue(len(info["quotas"]) >= 5)
+
+    def test_new_commands_and_views(self):
+        # Test command handlers
+        self.assertTrue(bot.handle_command(self.chat, {"message_id": 10}, "/limits"))
+        self.assertTrue(bot.handle_command(self.chat, {"message_id": 11}, "/video"))
+        self.assertTrue(bot.handle_command(self.chat, {"message_id": 12}, "/music"))
+        self.assertTrue(bot.handle_command(self.chat, {"message_id": 13}, "/image"))
+        self.assertTrue(bot.handle_command(self.chat, {"message_id": 14}, "/deepresearch"))
+
+        # Test view renderers
+        md, kb = bot.limits_view(self.chat)
+        self.assertIn("Лимиты и статус Gemini", md)
+        self.assertTrue(len(kb["inline_keyboard"]) >= 3)
+
+        md, kb = bot.video_guide_view(self.chat)
+        self.assertIn("Google Veo 2", md)
+
+        md, kb = bot.music_guide_view(self.chat)
+        self.assertIn("Google Lyria", md)
+
+        md, kb = bot.deepresearch_guide_view(self.chat)
+        self.assertIn("Deep Research", md)
+
+
 

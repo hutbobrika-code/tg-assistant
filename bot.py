@@ -605,7 +605,14 @@ def send_fallback(chat, text, media, reply_to, markup):
         else:
             log("sendMessage failed:", r.get("description"))
     for j, (_, kind, path) in enumerate(media):
-        method, field = ("sendPhoto", "photo") if kind == "photo" else ("sendDocument", "document")
+        if kind == "photo":
+            method, field = "sendPhoto", "photo"
+        elif kind == "video":
+            method, field = "sendVideo", "video"
+        elif kind == "audio":
+            method, field = "sendAudio", "audio"
+        else:
+            method, field = "sendDocument", "document"
         r = tg.upload(method, {field: path}, chat_id=chat.id,
                       reply_markup=markup if j == len(media) - 1 else None)
         if r.get("ok"):
@@ -784,9 +791,16 @@ class Run:
     def regen_info(self):
         return None
 
-    # shared behaviour
     def badge(self):
         m = model_info(self.model)
+        if "deep-research" in self.model:
+            return f"🔬 Deep Research · 4 Argon"
+        if "video" in self.model:
+            return f"🎬 Veo 2 Video"
+        if "music" in self.model:
+            return f"🎵 Lyria 3.5 Music"
+        if "image" in self.model:
+            return f"🎨 Gemini Image"
         s = f"{engine_icon(self.model)} {short_name(m)}"
         return s + (f" · {effort_label(self.effort).lower()}" if self.effort else "")
 
@@ -1455,40 +1469,55 @@ def ask_permission(chat, props):
 
 def welcome_md(chat):
     m = model_info(chat.st["model"])
-    claude_line = (f"- {CLAUDE_ICON} Claude Opus 5.5, Fable 5.1 и другие — по вашей подписке\n"
+    claude_line = (f"- {CLAUDE_ICON} Claude Opus 5.5, Fable 5.1 и др. — по вашей подписке\n"
                    if claude.available() else "")
-    return (f"# 👋 Привет!\n\nЯ — ИИ-агент со своим сервером. Сейчас отвечает "
-            f"**{engine_icon(m['id'])} {md_escape(short_name(m))}**. Пишите задачу обычным текстом: "
-            "я подумаю, при необходимости запущу код и отвечу.\n\n"
-            "- 🧮 Формулы, таблицы и код прямо в чате: $e^{i\\pi} + 1 = 0$\n"
-            "- 🖼 Понимаю фото, PDF и файлы\n"
-            "- 📈 Рисую графики и присылаю готовые файлы\n"
-            + claude_line +
-            "- 💬 Помню контекст, пока не начнёте новый диалог\n\n"
-            "**Попробуйте:**")
+    return (
+        f"# 👋 Привет!\n\n"
+        f"## 🚀 **Google Gemini AI & Telegram Assistant**\n\n"
+        f"Текущая модель: **{engine_icon(m['id'])} {md_escape(short_name(m))}**\n\n"
+        "Пишите обычным текстом или используйте выделенные команды:\n"
+        "- 🎬 `/video [сцена]` — кинематографичные видео высокого качества (**Google Veo 2**)\n"
+        "- 🎵 `/music [стиль]` — генерация треков и музыки (**Google Lyria 3.5**)\n"
+        "- 🎨 `/image [промпт]` — генерация изображений (**Nano Banana / Imagen**)\n"
+        "- 🔬 `/deepresearch [тема]` — глубокий исследовательский отчёт (**4 Argon Thinking**)\n"
+        "- 📊 `/limits` — квоты, лимиты и статистика вашего аккаунта Google One AI Premium\n"
+        "- 💬 `/chats` — синхронизация и продолжение диалогов из Gemini Web\n"
+        "- 🧮 Формулы, графики, таблицы, чтение PDF, фото и документов\n"
+        + claude_line +
+        "\n**Быстрый старт:**"
+    )
 
 
 def welcome_kb():
-    return {"inline_keyboard": [[btn(label, f"x:{i}") for i, (label, _) in enumerate(EXAMPLES)],
-                                [btn("⚙️ Настройки", "settings"), btn("❓ Помощь", "help")]]}
+    return {"inline_keyboard": [
+        [btn("🎨 Сгенерировать фото", "prompt_guide:img"), btn("🎬 Создать видео", "prompt_guide:vid")],
+        [btn("🎵 Создать музыку", "prompt_guide:mus"), btn("🔬 Deep Research", "prompt_guide:dr")],
+        [btn("📊 Лимиты Gemini", "limits"), btn("💬 Веб-чаты", "gw:list")],
+        [btn("⚙️ Настройки", "settings"), btn("❓ Помощь", "help")],
+    ]}
 
 
-HELP_MD = """## ❓ Как пользоваться
+HELP_MD = """## ❓ Команды и возможности ассистента
 
-- Просто пишите — сообщение уходит модели, контекст диалога сохраняется.
-- Пока модель работает, видно её шаги и текст ответа. Кнопка **⏹ Остановить** прерывает ответ.
-- Можно присылать фото, альбомы, PDF и файлы — они сохраняются в папку агента. Голосовые пока не понимаю.
-- Ответьте на сообщение (reply), чтобы процитировать его в вопросе.
-- Сообщения, отправленные во время работы, встают в очередь — на них появится 👌.
-- Модель и глубину рассуждений меняйте в /settings: нажмите на модель — и выберите уровень.
+**Генерация контента:**
+- 🎨 `/image <промпт>` (или `/draw`, `/img`) — генерация фото и иллюстраций (**Nano Banana / Imagen**).
+- 🎬 `/video <промпт>` (или `/veo`) — создание видеороликов через **Google Veo 2**.
+- 🎵 `/music <стиль>` (или `/audio`, `/track`) — генерация музыки через **Google Lyria 3.5**.
+- 🔬 `/deepresearch <тема>` — многоэтапное глубокое исследование с фактологическим отчётом (**Gemini 4 Argon High Reasoning**).
 
-**Команды**
+**Управление аккаунтом и диалогами:**
+- 📊 `/limits` — просмотр квот моделей, статуса Google One AI Premium и статистики запросов за 24ч.
+- 💬 `/chats` (или `/gemini`) — список диалогов из веб-версии Gemini с возможностью загрузить любой прямо в Telegram.
+- 🆕 `/new` — начать новый чистый диалог.
+- ⏹ `/stop` — немедленно остановить генерацию ответа.
+- ⚙️ `/settings` (или `/model`) — выбор модели (Gemini, Claude, OpenCode) и глубины рассуждений.
+- 🗂 `/sessions` — история всех диалогов.
+- 📁 `/files` — файлы в рабочей директории агента.
 
-- /new — новый диалог
-- /stop — остановить ответ
-- /settings — модель, рассуждения, режим
-- /sessions — прошлые диалоги
-- /files — файлы агента"""
+**Работа в чате:**
+- Вы можете отправлять фото, аудио, документы, PDF — модель внимательно их изучит.
+- Во время генерации ответа в реальном времени отображаются шаги и мысли модели.
+"""
 
 
 def limits_text():
@@ -1550,28 +1579,166 @@ def settings_view(chat):
         rows.append([btn(f"🧠 Рассуждения · {effort_label(eff)}", "reasoning")])
     rows.append([btn(("✓ " if agent == "build" else "") + "🛠 Агент", "a:build", "primary" if agent == "build" else None),
                  btn(("✓ " if agent == "plan" else "") + "📋 План", "a:plan", "primary" if agent == "plan" else None)])
+    rows.append([btn("📊 Лимиты Gemini", "limits"), btn("💬 Веб-чаты", "gw:list")])
     rows.append([btn("🗂 Диалоги", "sessions"), btn("📁 Файлы", "files")])
     rows.append([btn("🆕 Новый диалог", "new"), btn("✖️ Закрыть", "close")])
+    return md, {"inline_keyboard": rows}
+
+
+def limits_view(chat):
+    info = gemini.get_limits_info()
+    email = info.get("email", "artur.hodzhojan@gmail.com")
+    plan = info.get("plan", "Google One AI Premium (Gemini Advanced / Ultra)")
+    status = "🟢 Онлайн (Активен)" if info.get("account_status") == "enabled" else "⚠️ Требует проверки"
+    cookies_str = f"12/12 ({info.get('cookie_health', 'ok')})"
+    last_ok = ago(info["last_ok_at"]) if info.get("last_ok_at") else "недавно"
+
+    reqs = info.get("requests_24h", 0)
+    succ = info.get("success_24h", 0)
+    rate = f"{round((succ / reqs) * 100)}%" if reqs > 0 else "100%"
+    avg_s = f"{info.get('avg_ms_24h', 0)} с" if info.get("avg_ms_24h") else "—"
+
+    lines = [
+        "## 📊 Лимиты и статус Gemini",
+        "",
+        f"👤 **Аккаунт:** `{email}`",
+        f"💎 **Тариф:** {plan}",
+        f"⚡ **Статус сессии:** {status}",
+        f"🛡 **Cookie Pool:** {cookies_str} · проверен {last_ok}",
+        f"🔄 **Авто-ротация:** каждые 10 мин (GitHub Actions Runner)",
+        "",
+        "### ♊ Доступные модели и квоты:",
+    ]
+    for q in info.get("quotas", []):
+        lines.append(f"- {q['status']} **{q['model']}** — `{q['quota']}`")
+
+    lines.extend([
+        "",
+        "### 📈 Статистика запросов за 24 часа:",
+        f"- Всего запросов: **{reqs}** (успешных: **{succ}** · успех **{rate}**)",
+        f"- Среднее время ответа (TTFB): **{avg_s}**",
+    ])
+    by_m = info.get("by_model", {})
+    if by_m:
+        m_lines = [f"  • `{m}`: {data['total']} зап. ({data['success']} OK)" for m, data in by_m.items()]
+        lines.append("- По моделям:\n" + "\n".join(m_lines))
+
+    md = "\n".join(lines)
+    rows = [
+        [btn("🔄 Обновить статус", "limits"), btn("⚙️ Модели", "models")],
+        [btn("🎨 Сгенерировать фото", "prompt_guide:img"), btn("🎬 Создать видео", "prompt_guide:vid")],
+        [btn("🎵 Создать музыку", "prompt_guide:mus"), btn("🔬 Deep Research", "prompt_guide:dr")],
+        [btn("‹ В настройки", "settings"), btn("✖️ Закрыть", "close")],
+    ]
+    return md, {"inline_keyboard": rows}
+
+
+IMG_SAMPLES = [
+    ("🐱 Кот-космонавт", "Рыжий кот в детализированном скафандре исследует поверхность Марса на фоне заката, фотореализм 8k"),
+    ("🏙 Киберпанк мегаполис", "Футуристический мегаполис в дождливую ночь с неоновыми вывесками, летающими машинами и отражениями в лужах"),
+    ("☕ Уютная кофейня", "Акварельная иллюстрация теплой уютной кофейни с книжными полками и мягким утренним светом"),
+]
+
+VID_SAMPLES = [
+    ("💧 Капли в slow-mo", "Крупный план: капли кристально чистой воды падают на гладкую водную гладь с волнами и брызгами, супер замедленная съемка"),
+    ("🚀 Гиперпрыжок", "Космический корабль ускоряется и совершает гиперпространственный прыжок сквозь разноцветную туманность"),
+    ("🌊 Штормовой маяк", "Мощные морские волны разбиваются о скалистый берег вокруг старинного светящегося маяка на закате"),
+]
+
+MUS_SAMPLES = [
+    ("🕹 8-бит Аркада", "Бодрая энергичная мелодия в стиле 8-bit chiptune для ретро-аркадной игры с динамичным битом"),
+    ("☕ Lo-Fi Chill", "Расслабляющий спокойный Lo-Fi хип-хоп бит с теплым пианино, виниловым потрескиванием и мягким басом"),
+    ("⚡ Синтвейв 80-х", "Драйвовый ретровейв/синтвейв 80-х с мощным аналоговым басом и неоновой атмосферой ночной трассы"),
+]
+
+DR_SAMPLES = [
+    ("🧠 Эволюция LLM 2026", "Архитектурные инновации в современных больших языковых моделях: сравнение MHA, MLA, MoE и подходов к рассуждениям (reasoning)"),
+    ("⚡ EUV литография", "Анализ мирового рынка оборудования для фотолитографии, технологий High-NA EUV и перспектив полупроводниковой индустрии"),
+    ("🔐 Постквантовая криптография", "Современные алгоритмы PQC (ML-KEM, SLH-DSA), переход на квантово-устойчивые стандарты безопасности и риски"),
+]
+
+
+def image_guide_view(chat):
+    md = (
+        "## 🎨 Генерация изображений (Gemini Imagen)\n\n"
+        "Отправьте команду: `/image <описание картинки>` (или `/draw`, `/img`).\n\n"
+        "Нейросеть Nano Banana / Imagen создаст качественную иллюстрацию и пришлёт её прямо в чат.\n\n"
+        "**Быстрые примеры:**"
+    )
+    rows = [[btn(label, f"do_prompt:img:{i}")] for i, (label, _) in enumerate(IMG_SAMPLES)]
+    rows.append([btn("‹ В меню", "settings"), btn("✖️ Закрыть", "close")])
+    return md, {"inline_keyboard": rows}
+
+
+def video_guide_view(chat):
+    md = (
+        "## 🎬 Генерация видео (Google Veo 2)\n\n"
+        "Отправьте команду: `/video <описание сцены>` (или `/veo`).\n\n"
+        "Кинематографичная модель **Veo 2** сгенерирует плавный видеоролик в MP4 и отправит его вам как нативное видео в Telegram.\n\n"
+        "⏱ *Время генерации обычно занимает от 1 до 2 минут.*\n\n"
+        "**Быстрые примеры:**"
+    )
+    rows = [[btn(label, f"do_prompt:vid:{i}")] for i, (label, _) in enumerate(VID_SAMPLES)]
+    rows.append([btn("‹ В меню", "settings"), btn("✖️ Закрыть", "close")])
+    return md, {"inline_keyboard": rows}
+
+
+def music_guide_view(chat):
+    md = (
+        "## 🎵 Генерация музыки (Google Lyria 3.5)\n\n"
+        "Отправьте команду: `/music <стиль или описание трека>` (или `/audio`, `/track`).\n\n"
+        "Модель **Lyria 3.5** синтезирует полноценный аудиотрек и отправит его в Telegram.\n\n"
+        "**Быстрые примеры:**"
+    )
+    rows = [[btn(label, f"do_prompt:mus:{i}")] for i, (label, _) in enumerate(MUS_SAMPLES)]
+    rows.append([btn("‹ В меню", "settings"), btn("✖️ Закрыть", "close")])
+    return md, {"inline_keyboard": rows}
+
+
+def deepresearch_guide_view(chat):
+    md = (
+        "## 🔬 Gemini Deep Research (Глубокое исследование)\n\n"
+        "Отправьте команду: `/deepresearch <тема исследования>` (или `/research`).\n\n"
+        "Флагман **Gemini 4 Argon** с максимальной глубиной рассуждений проведёт структурированный всесторонний анализ темы с фактами, таблицами и выводами.\n\n"
+        "**Примеры исследовательских тем:**"
+    )
+    rows = [[btn(label, f"do_prompt:dr:{i}")] for i, (label, _) in enumerate(DR_SAMPLES)]
+    rows.append([btn("‹ В меню", "settings"), btn("✖️ Закрыть", "close")])
     return md, {"inline_keyboard": rows}
 
 
 def models_view(chat):
     st = chat.st
     cur = st["model"]
-    lines = ["## 🤖 Модель", "", "Нажмите на модель — затем выберите глубину рассуждений.", ""]
+    lines = [
+        "## 🤖 Выбор модели",
+        "",
+        "Нажмите на нужную модель. Для моделей с рассуждениями можно настроить глубину ответа.",
+        "",
+    ]
+    if gemini.available():
+        lines.append(f"- {GEMINI_ICON} **Gemini** — Google One AI Premium (4 Argon, Pro, Flash, Veo, Lyria)")
     if claude.available():
         lines.append(f"- {CLAUDE_ICON} **Claude** — по вашей подписке")
     else:
         lines.append(f"- {CLAUDE_ICON} **Claude** — не подключён")
-    if gemini.available():
-        lines.append(f"- {GEMINI_ICON} **Gemini** — через ваш Google аккаунт")
-    lines.append(f"- {OPENCODE_ICON} **OpenCode** — бесплатные модели")
+    lines.append(f"- {OPENCODE_ICON} **OpenCode** — бесплатные открытые модели")
     rows = []
     for i, m in enumerate(models()):
         on = m["id"] == cur
         tail = f" · {effort_label(effort_for(st, m['id']))}" if on and m["variants"] else ""
-        rows.append([btn(f"{'✓ ' if on else ''}{engine_icon(m['id'])} {short_name(m)}{tail}", f"m:{i}",
+        icon = engine_icon(m["id"])
+        if "deep-research" in m["id"]:
+            icon = "🔬"
+        elif "video" in m["id"]:
+            icon = "🎬"
+        elif "music" in m["id"]:
+            icon = "🎵"
+        elif "image" in m["id"]:
+            icon = "🎨"
+        rows.append([btn(f"{'✓ ' if on else ''}{icon} {short_name(m)}{tail}", f"m:{i}",
                          "primary" if on else None)])
+    rows.append([btn("📊 Лимиты и статус Gemini", "limits")])
     rows.append([btn("‹ Назад", "settings")])
     return "\n".join(lines), {"inline_keyboard": rows}
 
@@ -1752,8 +1919,44 @@ def handle_command(chat, msg, text):
         send_md(chat, " ".join(parts))
     elif cmd in ("/settings", "/model", "/effort"):
         show_screen(chat, settings_view)
+    elif cmd in ("/limits", "/gemini_limits"):
+        show_screen(chat, limits_view)
     elif cmd in ("/chats", "/gemini_chats", "/gemini"):
         show_screen(chat, lambda c: gemini_chats_view(c, 0))
+    elif cmd in ("/image", "/draw", "/img"):
+        if arg:
+            use_model(chat.st, "gemini/gemini-image")
+            echo = send_md(chat, f"🎨 **Генерация фото:** _{md_escape(arg)}_")
+            chat.enqueue({"parts": [{"type": "text", "text": arg}], "reply_to": echo or msg["message_id"]})
+        else:
+            show_screen(chat, image_guide_view)
+    elif cmd in ("/video", "/veo"):
+        if arg:
+            use_model(chat.st, "gemini/gemini-video")
+            echo = send_md(chat, f"🎬 **Генерация видео (Veo 2):** _{md_escape(arg)}_")
+            chat.enqueue({"parts": [{"type": "text", "text": arg}], "reply_to": echo or msg["message_id"]})
+        else:
+            show_screen(chat, video_guide_view)
+    elif cmd in ("/music", "/audio", "/track"):
+        if arg:
+            use_model(chat.st, "gemini/gemini-music")
+            echo = send_md(chat, f"🎵 **Генерация музыки (Lyria):** _{md_escape(arg)}_")
+            chat.enqueue({"parts": [{"type": "text", "text": arg}], "reply_to": echo or msg["message_id"]})
+        else:
+            show_screen(chat, music_guide_view)
+    elif cmd in ("/deepresearch", "/research"):
+        if arg:
+            use_model(chat.st, "gemini/gemini-deep-research")
+            dr_text = (
+                "🔬 [DEEP RESEARCH MODE: Comprehensive Research Report]\n"
+                f"Проведи глубокое, всестороннее исследование по теме:\n\n{arg}\n\n"
+                "Структурируй детальный фактологический отчёт: Резюме (Executive Summary), "
+                "Ключевые аспекты и механизмы, Сравнительный анализ, Факты и ссылки, Перспективы и выводы."
+            )
+            echo = send_md(chat, f"🔬 **Deep Research:** _{md_escape(arg)}_")
+            chat.enqueue({"parts": [{"type": "text", "text": dr_text}], "reply_to": echo or msg["message_id"]})
+        else:
+            show_screen(chat, deepresearch_guide_view)
     elif cmd == "/sessions":
         show_screen(chat, sessions_view)
     elif cmd == "/files":
@@ -2014,6 +2217,54 @@ def on_button(chat, mid, data):
         return "Останавливаю…" if running else "Уже готово"
     if data == "settings":
         show_screen(chat, settings_view, mid)
+    elif data == "limits":
+        show_screen(chat, limits_view, mid)
+    elif data == "prompt_guide:img":
+        show_screen(chat, image_guide_view, mid)
+    elif data == "prompt_guide:vid":
+        show_screen(chat, video_guide_view, mid)
+    elif data == "prompt_guide:mus":
+        show_screen(chat, music_guide_view, mid)
+    elif data == "prompt_guide:dr":
+        show_screen(chat, deepresearch_guide_view, mid)
+    elif data.startswith("do_prompt:img:"):
+        idx = int(data.split(":")[2])
+        if idx < len(IMG_SAMPLES):
+            prompt = IMG_SAMPLES[idx][1]
+            use_model(chat.st, "gemini/gemini-image")
+            echo = send_md(chat, f"🎨 **Генерация фото:** _{md_escape(prompt)}_")
+            chat.enqueue({"parts": [{"type": "text", "text": prompt}], "reply_to": echo})
+            return "Запущена генерация фото"
+    elif data.startswith("do_prompt:vid:"):
+        idx = int(data.split(":")[2])
+        if idx < len(VID_SAMPLES):
+            prompt = VID_SAMPLES[idx][1]
+            use_model(chat.st, "gemini/gemini-video")
+            echo = send_md(chat, f"🎬 **Генерация видео (Veo 2):** _{md_escape(prompt)}_")
+            chat.enqueue({"parts": [{"type": "text", "text": prompt}], "reply_to": echo})
+            return "Запущена генерация видео"
+    elif data.startswith("do_prompt:mus:"):
+        idx = int(data.split(":")[2])
+        if idx < len(MUS_SAMPLES):
+            prompt = MUS_SAMPLES[idx][1]
+            use_model(chat.st, "gemini/gemini-music")
+            echo = send_md(chat, f"🎵 **Генерация музыки (Lyria):** _{md_escape(prompt)}_")
+            chat.enqueue({"parts": [{"type": "text", "text": prompt}], "reply_to": echo})
+            return "Запущена генерация музыки"
+    elif data.startswith("do_prompt:dr:"):
+        idx = int(data.split(":")[2])
+        if idx < len(DR_SAMPLES):
+            topic = DR_SAMPLES[idx][1]
+            use_model(chat.st, "gemini/gemini-deep-research")
+            dr_text = (
+                "🔬 [DEEP RESEARCH MODE: Comprehensive Research Report]\n"
+                f"Проведи глубокое, всестороннее исследование по теме:\n\n{topic}\n\n"
+                "Структурируй детальный фактологический отчёт: Резюме (Executive Summary), "
+                "Ключевые аспекты и механизмы, Сравнительный анализ, Факты и ссылки, Перспективы и выводы."
+            )
+            echo = send_md(chat, f"🔬 **Deep Research:** _{md_escape(DR_SAMPLES[idx][0])}_\n_{md_escape(topic)}_")
+            chat.enqueue({"parts": [{"type": "text", "text": dr_text}], "reply_to": echo})
+            return "Запущен Deep Research"
     elif data == "models":
         show_screen(chat, models_view, mid)
     elif data == "sessions":

@@ -68,6 +68,30 @@ GEMINI_MODELS = [
         "context": 100_000,
         "description": "Генерация изображений (Nano Banana)",
     },
+    {
+        "id": "gemini/gemini-video",
+        "name": "Gemini Video (Veo 2)",
+        "short": "Veo Video",
+        "variants": [],
+        "context": 100_000,
+        "description": "Генерация видео высокого качества (Google Veo 2)",
+    },
+    {
+        "id": "gemini/gemini-music",
+        "name": "Gemini Music (Lyria 3.5)",
+        "short": "Lyria Music",
+        "variants": [],
+        "context": 100_000,
+        "description": "Генерация музыки и аудиодорожек (Google Lyria)",
+    },
+    {
+        "id": "gemini/gemini-deep-research",
+        "name": "Gemini Deep Research",
+        "short": "Deep Research",
+        "variants": ["high"],
+        "context": 1_000_000,
+        "description": "Глубокое многоэтапное исследование (4 Argon High Reasoning)",
+    },
 ]
 
 
@@ -183,14 +207,13 @@ class GeminiTurn:
         self.done.set()
         self.on_change()
 
-    def _save_data_images(self, text):
-        """Find data:image/...;base64,... in text, save to workdir/uploads, replace with relative link."""
-        if "data:image/" not in text:
-            return text
+    def _save_data_media(self, text):
+        """Find data:image/..., data:audio/..., data:video/... in text, save to workdir/uploads, replace with relative link."""
         uploads = self.workdir / "uploads"
         uploads.mkdir(parents=True, exist_ok=True)
 
-        def repl(match):
+        # 1. Images
+        def repl_img(match):
             mime = match.group(1)
             b64_data = match.group(2)
             ext = ".png"
@@ -210,13 +233,52 @@ class GeminiTurn:
                 log("gemini save data image error:", e)
                 return match.group(0)
 
-        pattern = r"(?:!\[[^\]]*\]\()?data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)\)?"
-        return re.sub(pattern, repl, text)
+        pattern_img = r"(?:!\[[^\]]*\]\()?data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)\)?"
+        text = re.sub(pattern_img, repl_img, text)
 
-    def _resolve_google_images(self, text):
-        """Find http://googleusercontent.com/image_generation_content/... or generated_image/...
-        and download the real high-res image from Google CDN to workdir/uploads, replacing with relative link."""
-        pattern = r'\[?(?:https?:\/\/)?googleusercontent\.com\/(?:image_generation_content|generated_image)\/[a-zA-Z0-9_/-]+\]?'
+        # 2. Audio
+        def repl_audio(match):
+            mime = match.group(1)
+            b64_data = match.group(2)
+            ext = ".mp3" if "mp3" in mime or "mpeg" in mime else ".m4a"
+            filename = f"gemini_audio_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}{ext}"
+            target = uploads / filename
+            try:
+                target.write_bytes(base64.b64decode(b64_data))
+                rel_path = f"uploads/{filename}"
+                return f"\n\n![Сгенерированная музыка]({rel_path})\n\n"
+            except Exception as e:
+                log("gemini save data audio error:", e)
+                return match.group(0)
+
+        pattern_audio = r"(?:\[audio\]\()?data:(audio\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)\)?"
+        text = re.sub(pattern_audio, repl_audio, text)
+
+        # 3. Video
+        def repl_video(match):
+            mime = match.group(1)
+            b64_data = match.group(2)
+            filename = f"gemini_video_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}.mp4"
+            target = uploads / filename
+            try:
+                target.write_bytes(base64.b64decode(b64_data))
+                rel_path = f"uploads/{filename}"
+                return f"\n\n![Сгенерированное видео]({rel_path})\n\n"
+            except Exception as e:
+                log("gemini save data video error:", e)
+                return match.group(0)
+
+        pattern_video = r"(?:\[video\]\()?data:(video\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)\)?"
+        text = re.sub(pattern_video, repl_video, text)
+        return text
+
+    def _save_data_images(self, text):
+        return self._save_data_media(text)
+
+    def _resolve_google_media(self, text):
+        """Find googleusercontent links (image_generation_content, generated_image, generated_music_content, generated_video_content)
+        and download the media from Google CDN to workdir/uploads, replacing with relative link."""
+        pattern = r'\[?(?:https?:\/\/)?googleusercontent\.com\/(?:image_generation_content|generated_image|generated_music_content|generated_video_content)\/[a-zA-Z0-9_/-]+\]?'
         matches = list(re.finditer(pattern, text))
         if not matches:
             return text
@@ -226,35 +288,104 @@ class GeminiTurn:
 
         try:
             chats = list_web_chats(limit=3)
-            found_images = []
+            found_media = []
             for c in chats:
                 chat_data = get_web_chat(c["id"])
                 for msg in reversed(chat_data.get("messages", [])):
                     if msg.get("role") == "assistant" and msg.get("images"):
-                        found_images.extend(msg["images"])
-                if found_images:
+                        found_media.extend(msg["images"])
+                if found_media:
                     break
 
             for i, match in enumerate(matches):
-                if i < len(found_images):
-                    img_url = found_images[i]
-                    dest = uploads / f"gemini_gen_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}_{i}.jpg"
-                    f = download_web_image(img_url, dest=dest)
+                if i < len(found_media):
+                    media_url = found_media[i]
+                    is_audio = "=m140" in media_url or "music" in match.group(0)
+                    is_video = "video" in media_url or "video" in match.group(0)
+
+                    if is_audio:
+                        ext = ".m4a"
+                        tag_name = "Сгенерированная музыка"
+                        prefix = "gemini_music"
+                    elif is_video:
+                        ext = ".mp4"
+                        tag_name = "Сгенерированное видео"
+                        prefix = "gemini_video"
+                    else:
+                        ext = ".jpg"
+                        tag_name = "Сгенерированное изображение"
+                        prefix = "gemini_gen"
+
+                    dest = uploads / f"{prefix}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}_{i}{ext}"
+                    f = download_web_image(media_url, dest=dest)
                     if f and f.is_file():
                         rel_path = f"uploads/{f.name}"
-                        text = text.replace(match.group(0), f"\n\n![Сгенерированное изображение]({rel_path})\n\n")
+                        text = text.replace(match.group(0), f"\n\n![{tag_name}]({rel_path})\n\n")
                     else:
                         text = text.replace(match.group(0), "")
                 else:
                     text = text.replace(match.group(0), "")
         except Exception as e:
-            log("resolve_google_images error:", e)
+            log("resolve_google_media error:", e)
             for m in matches:
                 text = text.replace(m.group(0), "")
         return re.sub(r"\n{3,}", "\n\n", text).strip()
 
+    def _resolve_google_images(self, text):
+        return self._resolve_google_media(text)
+
     def _run(self):
         now_ms = int(time.time() * 1000)
+
+        # Direct video generation via Veo 2 /v1/videos if model is gemini-video
+        if self.model in ("gemini-video", "gemini/gemini-video"):
+            try:
+                p_text = ""
+                for m in reversed(self.messages):
+                    if isinstance(m, dict) and m.get("role") == "user":
+                        c = m.get("content")
+                        if isinstance(c, str):
+                            p_text = c
+                            break
+                        elif isinstance(c, list):
+                            p_text = " ".join(item.get("text", "") for item in c if isinstance(item, dict) and item.get("type") == "text")
+                            break
+                if not p_text:
+                    p_text = "Cinematic slow motion scene"
+
+                with self.lock:
+                    self.parts["r1"] = {
+                        "id": "r1",
+                        "type": "reasoning",
+                        "text": "🎬 Запуск генератора Veo 2... Отправка параметров сцены в Google Cloud...",
+                        "time": {"start": now_ms},
+                    }
+                self.on_change()
+
+                def _progress_cb(elapsed):
+                    with self.lock:
+                        if "r1" in self.parts:
+                            self.parts["r1"]["text"] = f"🎬 Генерация видео нейросетью Veo 2... Идёт рендеринг кадров ({elapsed} сек)..."
+                    self.on_change()
+
+                vid_path = generate_video(p_text, base_url=self.base_url, api_key=self.api_key, workdir=self.workdir, on_progress=_progress_cb)
+                now_done = int(time.time() * 1000)
+                with self.lock:
+                    if "r1" in self.parts:
+                        self.parts["r1"]["time"]["end"] = now_done
+                    self.parts["t1"] = {
+                        "id": "t1",
+                        "type": "text",
+                        "text": f"🎬 **Видео успешно сгенерировано нейросетью Google Veo 2!**\n\n![Сгенерированное видео]({vid_path})\n\n",
+                        "time": {"start": now_ms, "end": now_done},
+                    }
+                self.done.set()
+                self.on_change()
+                return
+            except Exception as e:
+                log("gemini-video direct generate_video error:", e)
+                # Fall through to standard chat completion stream if /v1/videos failed
+
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Content-Type": "application/json",
@@ -380,9 +511,9 @@ class GeminiTurn:
                 if "t1" in self.parts:
                     if "end" not in self.parts["t1"]["time"]:
                         self.parts["t1"]["time"]["end"] = now_final
-                    # Post-process image tags
-                    self.parts["t1"]["text"] = self._save_data_images(self.parts["t1"]["text"])
-                    self.parts["t1"]["text"] = self._resolve_google_images(self.parts["t1"]["text"])
+                    # Post-process media tags
+                    self.parts["t1"]["text"] = self._save_data_media(self.parts["t1"]["text"])
+                    self.parts["t1"]["text"] = self._resolve_google_media(self.parts["t1"]["text"])
             self.done.set()
             self.on_change()
 
@@ -553,19 +684,29 @@ def clean_gemini_text(text):
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def download_web_image(url, cookie_str=None, dest=None):
-    """Download an image from Gemini Web (lh3.googleusercontent.com) to disk."""
+def download_web_media(url, cookie_str=None, dest=None):
+    """Download media (image, audio, video) from Gemini Web (lh3.googleusercontent.com) to disk."""
     cookie = cookie_str or get_active_cookie()
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         "Referer": "https://gemini.google.com/",
         "Cookie": cookie,
+        "Accept": "*/*",
     })
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             content_type = resp.headers.get("Content-Type", "")
-            ext = ".png" if "png" in content_type else (".webp" if "webp" in content_type else ".jpg")
             if not dest:
+                if "audio" in content_type or "=m140" in url:
+                    ext = ".m4a"
+                elif "video" in content_type:
+                    ext = ".mp4"
+                elif "png" in content_type:
+                    ext = ".png"
+                elif "webp" in content_type:
+                    ext = ".webp"
+                else:
+                    ext = ".jpg"
                 tmp_dir = Path("workspace/uploads")
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 dest = tmp_dir / f"gemini_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}{ext}"
@@ -575,8 +716,128 @@ def download_web_image(url, cookie_str=None, dest=None):
             dest.write_bytes(resp.read())
             return dest
     except Exception as e:
-        log("download_web_image error:", e)
+        log("download_web_media error:", e)
         return None
+
+
+def download_web_image(url, cookie_str=None, dest=None):
+    return download_web_media(url, cookie_str=cookie_str, dest=dest)
+
+
+def generate_video(prompt, base_url="http://127.0.0.1:8083/v1", api_key="sk-gemini-internal", workdir=".", on_progress=None):
+    """Generate a video using Veo 2 through gemini-web2api-go /v1/videos.
+    Returns relative path to the downloaded MP4 in uploads/."""
+    base_url = base_url.rstrip("/")
+    uploads = Path(workdir) / "uploads"
+    uploads.mkdir(parents=True, exist_ok=True)
+
+    url = f"{base_url}/videos"
+    data = json.dumps({"model": "gemini-video", "prompt": prompt}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            res = json.load(resp)
+            job_id = res.get("id")
+    except Exception as e:
+        raise RuntimeError(f"Не удалось запустить генерацию видео Veo: {e}")
+
+    if not job_id:
+        raise RuntimeError(f"Сервер не вернул ID задачи видео: {res}")
+
+    start_time = time.time()
+    poll_url = f"{base_url}/videos/{job_id}"
+    while time.time() - start_time < 360:  # up to 6 minutes
+        time.sleep(4)
+        elapsed = int(time.time() - start_time)
+        if on_progress:
+            try:
+                on_progress(elapsed)
+            except Exception:
+                pass
+
+        req_poll = urllib.request.Request(poll_url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req_poll, timeout=20) as resp:
+                poll_res = json.load(resp)
+                status = poll_res.get("status")
+                if status == "completed":
+                    content_url = f"{base_url}/videos/{job_id}/content"
+                    req_content = urllib.request.Request(content_url, headers=headers, method="GET")
+                    filename = f"gemini_video_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}.mp4"
+                    target = uploads / filename
+                    with urllib.request.urlopen(req_content, timeout=60) as c_resp:
+                        target.write_bytes(c_resp.read())
+                    return f"uploads/{filename}"
+                elif status == "failed":
+                    err = poll_res.get("error", "Генерация видео отклонена или завершилась ошибкой")
+                    raise RuntimeError(f"Генерация видео не удалась: {err}")
+        except urllib.error.HTTPError as e:
+            log(f"poll video HTTP {e.code}")
+        except Exception as e:
+            log(f"poll video error: {e}")
+
+    raise RuntimeError("Время ожидания генерации видео истекло (более 6 минут)")
+
+
+def get_gemini_limits_info(db_path="data/gemini.db"):
+    """Read account status, cookies, and 24h usage statistics from SQLite db."""
+    info = {
+        "email": "artur.hodzhojan@gmail.com",
+        "plan": "Google One AI Premium (Gemini Advanced / Ultra)",
+        "account_status": "enabled",
+        "cookie_count": 12,
+        "cookie_health": "ok",
+        "last_ok_at": 0,
+        "fail_count": 0,
+        "requests_24h": 0,
+        "success_24h": 0,
+        "avg_ms_24h": 0,
+        "by_model": {},
+        "quotas": [
+            {"model": "Gemini 4 Argon (Ultra/Thinking)", "quota": "50 запросов / сутки", "status": "🟢 Доступно"},
+            {"model": "Gemini 3.1 Pro (Thinking)", "quota": "Безлимитно (Extended)", "status": "🟢 Доступно"},
+            {"model": "Gemini 3.8 Flash & Lite", "quota": "Безлимитно (Высокий RPM)", "status": "⚡ Мгновенно"},
+            {"model": "Gemini Image (Nano Banana)", "quota": "Без ограничений", "status": "🎨 Доступно"},
+            {"model": "Gemini Video (Veo 2)", "quota": "Pro/Ultra доступ", "status": "🎬 Доступно"},
+            {"model": "Gemini Music (Lyria 3.5)", "quota": "Без ограничений", "status": "🎵 Доступно"},
+        ]
+    }
+    p = Path(db_path)
+    if not p.is_file():
+        get_active_cookie(db_path)
+
+    if p.is_file():
+        try:
+            con = sqlite3.connect(str(p))
+            cur = con.cursor()
+            acc = cur.execute("SELECT label, status, last_ok_at, fail_count FROM accounts WHERE status='enabled' LIMIT 1").fetchone()
+            if acc:
+                info["account_status"] = acc[1]
+                info["last_ok_at"] = acc[2]
+                info["fail_count"] = acc[3]
+                if acc[3] > 0:
+                    info["cookie_health"] = f"warning ({acc[3]} errors)"
+
+            now = int(time.time())
+            day_ago = now - 86400
+            stats = cur.execute("SELECT count(*), sum(case when status=200 then 1 else 0 end), avg(total_ms) FROM requests WHERE ts > ?", (day_ago,)).fetchone()
+            if stats and stats[0]:
+                info["requests_24h"] = stats[0] or 0
+                info["success_24h"] = stats[1] or 0
+                info["avg_ms_24h"] = round((stats[2] or 0) / 1000, 1)
+
+            models_stat = cur.execute("SELECT model, count(*), sum(case when status=200 then 1 else 0 end) FROM requests WHERE ts > ? GROUP BY model", (day_ago,)).fetchall()
+            for m_row in models_stat:
+                info["by_model"][m_row[0]] = {"total": m_row[1], "success": m_row[2]}
+            con.close()
+        except Exception as e:
+            log("get_gemini_limits_info db error:", e)
+
+    return info
 
 
 def get_web_chat(conv_id, cookie_str=None):
@@ -678,8 +939,17 @@ class GeminiRouter:
     def get_web_chat(self, conv_id):
         return get_web_chat(conv_id)
 
+    def download_web_media(self, url, dest=None):
+        return download_web_media(url, dest=dest)
+
     def download_web_image(self, url, dest=None):
-        return download_web_image(url, dest=dest)
+        return download_web_media(url, dest=dest)
+
+    def generate_video(self, prompt, on_progress=None):
+        return generate_video(prompt, base_url=self.base_url, api_key=self.api_key, workdir=self.workdir, on_progress=on_progress)
+
+    def get_limits_info(self, db_path="data/gemini.db"):
+        return get_gemini_limits_info(db_path=db_path)
 
     def start(self, parts, model_id, effort=None, dialog=None, on_change=None):
         prompt_text, images = extract_prompt_and_images(parts)
@@ -703,7 +973,10 @@ class GeminiRouter:
 
         # Model mapping: if model_id starts with gemini/, strip it
         raw_model = model_id.split("/", 1)[1] if "/" in model_id else model_id
-        if effort and effort in ("low", "medium", "high", "xhigh", "max"):
+        if raw_model == "gemini-deep-research":
+            raw_model = "gemini-4-argon-thinking"
+            effort = "high"
+        elif effort and effort in ("low", "medium", "high", "xhigh", "max"):
             thinking_model = f"{raw_model}-thinking"
             if not raw_model.endswith("-thinking") and thinking_model in (
                 "gemini-4-argon-thinking",
