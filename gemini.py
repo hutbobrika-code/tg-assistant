@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 
@@ -220,9 +221,19 @@ class GeminiTurn:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
+        clean_messages = []
+        for m in self.messages:
+            if isinstance(m, dict):
+                clean_messages.append({
+                    "role": m.get("role", "user"),
+                    "content": m.get("content", ""),
+                })
+            else:
+                clean_messages.append(m)
+
         body = {
             "model": self.model,
-            "messages": self.messages,
+            "messages": clean_messages,
             "stream": True,
         }
         if self.effort:
@@ -339,17 +350,8 @@ _XSRF_CACHE = {}
 def get_active_cookie(db_path="data/gemini.db"):
     """Read current active Google session cookie from data/gemini.db or decrypted state."""
     p = Path(db_path)
-    if p.is_file():
-        try:
-            con = sqlite3.connect(str(p))
-            row = con.execute("SELECT cookie FROM accounts WHERE status='enabled' ORDER BY id DESC LIMIT 1").fetchone()
-            con.close()
-            if row and row[0]:
-                return row[0]
-        except Exception as e:
-            log("get_active_cookie from db error:", e)
-
     enc_file = Path("state/gemini.db.enc")
+
     key = os.environ.get("STATE_KEY")
     if not key:
         key_file = Path(os.path.expanduser("~/.gemini_state_key"))
@@ -364,25 +366,27 @@ def get_active_cookie(db_path="data/gemini.db"):
                 pass
 
     if enc_file.is_file() and key:
-        tmp_db = Path(f"/tmp/read_gemini_{int(time.time() * 1000)}.db")
+        enc_mtime = enc_file.stat().st_mtime
+        db_mtime = p.stat().st_mtime if p.is_file() else 0
+        if enc_mtime > db_mtime or not p.is_file():
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                cmd = ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "100000", "-salt",
+                       "-pass", f"pass:{key}", "-in", str(enc_file), "-out", str(p)]
+                subprocess.run(cmd, capture_output=True)
+            except Exception as e:
+                log("auto-decrypt gemini.db error:", e)
+
+    if p.is_file():
         try:
-            cmd = ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "100000", "-salt",
-                   "-pass", f"pass:{key}", "-in", str(enc_file), "-out", str(tmp_db)]
-            res = subprocess.run(cmd, capture_output=True)
-            if res.returncode == 0:
-                con = sqlite3.connect(str(tmp_db))
-                row = con.execute("SELECT cookie FROM accounts WHERE status='enabled' ORDER BY id DESC LIMIT 1").fetchone()
-                con.close()
-                if row and row[0]:
-                    return row[0]
+            con = sqlite3.connect(str(p))
+            row = con.execute("SELECT cookie FROM accounts WHERE status='enabled' ORDER BY id DESC LIMIT 1").fetchone()
+            con.close()
+            if row and row[0]:
+                return row[0]
         except Exception as e:
-            log("get_active_cookie decrypt error:", e)
-        finally:
-            if tmp_db.exists():
-                try:
-                    tmp_db.unlink()
-                except OSError:
-                    pass
+            log("get_active_cookie from db error:", e)
+
     return ""
 
 
@@ -474,6 +478,64 @@ def list_web_chats(cookie_str=None, limit=50):
         return []
 
 
+def _extract_gemini_images(data):
+    urls = []
+    seen = set()
+
+    def _walk(obj):
+        if isinstance(obj, str):
+            if "lh3.googleusercontent.com/" in obj and obj.startswith("http"):
+                if obj not in seen:
+                    seen.add(obj)
+                    urls.append(obj)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                _walk(v)
+
+    _walk(data)
+    return urls
+
+
+def clean_gemini_text(text):
+    if not text:
+        return ""
+    text = re.sub(r"```([a-zA-Z0-9_-]+)\?[^\n]*", r"```\1", text)
+    text = re.sub(r"```\?[^\n]*", "```", text)
+    text = re.sub(r"\[http://googleusercontent\.com/generated_image/\d+\]", "", text)
+    text = re.sub(r"\[file-tag:[^\]]+\]", "", text)
+    text = re.sub(r"\[cite:\s*\d+\]", "", text)
+    return text.strip()
+
+
+def download_web_image(url, cookie_str=None, dest=None):
+    """Download an image from Gemini Web (lh3.googleusercontent.com) to disk."""
+    cookie = cookie_str or get_active_cookie()
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "Referer": "https://gemini.google.com/",
+        "Cookie": cookie,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            ext = ".png" if "png" in content_type else (".webp" if "webp" in content_type else ".jpg")
+            if not dest:
+                tmp_dir = Path("workspace/uploads")
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                dest = tmp_dir / f"gemini_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}{ext}"
+            else:
+                dest = Path(dest)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(resp.read())
+            return dest
+    except Exception as e:
+        log("download_web_image error:", e)
+        return None
+
+
 def get_web_chat(conv_id, cookie_str=None):
     """Fetch all messages from a specific Gemini web chat."""
     cookie = cookie_str or get_active_cookie()
@@ -512,11 +574,15 @@ def get_web_chat(conv_id, cookie_str=None):
                             for turn in turns:
                                 u_text = ""
                                 try:
-                                    u_text = turn[2][0][0]
+                                    u_text = turn[2][0][0] or ""
                                 except Exception:
                                     pass
-                                if u_text:
-                                    messages.append({"role": "user", "content": u_text})
+                                u_imgs = _extract_gemini_images(turn[2]) if len(turn) > 2 else []
+                                if u_text or u_imgs:
+                                    msg = {"role": "user", "content": u_text}
+                                    if u_imgs:
+                                        msg["images"] = u_imgs
+                                    messages.append(msg)
 
                                 a_text = ""
                                 try:
@@ -529,8 +595,13 @@ def get_web_chat(conv_id, cookie_str=None):
                                                 a_text = "".join(p for p in parts if isinstance(p, str))
                                 except Exception:
                                     pass
-                                if a_text:
-                                    messages.append({"role": "assistant", "content": a_text})
+                                a_imgs = [img for img in _extract_gemini_images(turn[3]) if img not in u_imgs] if len(turn) > 3 else []
+                                a_text = clean_gemini_text(a_text)
+                                if a_text or a_imgs:
+                                    msg = {"role": "assistant", "content": a_text}
+                                    if a_imgs:
+                                        msg["images"] = a_imgs
+                                    messages.append(msg)
                 except Exception:
                     pass
         return {"id": conv_id, "messages": messages}
@@ -563,6 +634,9 @@ class GeminiRouter:
 
     def get_web_chat(self, conv_id):
         return get_web_chat(conv_id)
+
+    def download_web_image(self, url, dest=None):
+        return download_web_image(url, dest=dest)
 
     def start(self, parts, model_id, effort=None, dialog=None, on_change=None):
         prompt_text, images = extract_prompt_and_images(parts)

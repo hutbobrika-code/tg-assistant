@@ -2105,6 +2105,7 @@ def on_button(chat, mid, data):
     elif data.startswith("gw:o:"):
         conv_id = data.split(":", 2)[2]
         try:
+            edit_md(chat, mid, "⏳ Загружаю веб-чат...")
             res = gemini.get_web_chat(conv_id)
             msgs = res.get("messages", [])
             all_chats = gemini.list_web_chats(limit=50)
@@ -2119,20 +2120,63 @@ def on_button(chat, mid, data):
             chat.strip_answer_buttons()
             save_state()
             m = model_info(st["model"])
-            last_preview = ""
-            if msgs:
-                last_msg = msgs[-1]
-                role_name = "Gemini" if last_msg["role"] == "assistant" else "Вы"
-                last_preview = f"\n\n**Последнее сообщение ({role_name}):**\n_{md_escape(short(last_msg['content'], 180))}_"
-            loaded_text = (
-                f"💬 **Загружен веб-чат Gemini:**\n«{md_escape(found_title)}» · {len(msgs)} сообщ.\n"
-                f"Модель: {engine_icon(m['id'])} **{md_escape(short_name(m))}**{last_preview}\n\n"
-                "✍️ **Пишите вопрос прямо сюда** — бот продолжит диалог с полным контекстом!"
-            )
-            edit_md(chat, mid, loaded_text,
+
+            # Update menu message
+            edit_md(chat, mid, f"✓ Веб-чат «{md_escape(found_title)}» загружен ниже ⬇️",
                     {"inline_keyboard": [
-                        [btn("🆕 Новый диалог", "new"), btn("‹ Все веб-чаты", "gw:list")],
-                        [btn("⚙️ Настройки", "settings")],
+                        [btn("‹ Все веб-чаты", "gw:list"), btn("🆕 Новый диалог", "new")],
+                    ]})
+
+            # Render dialogue history
+            display_msgs = msgs[-8:] if len(msgs) > 8 else msgs
+            header_note = (
+                f"📂 **Веб-чат Gemini:** «{md_escape(found_title)}»\n"
+                f"Модель: {engine_icon(m['id'])} **{md_escape(short_name(m))}**\n"
+            )
+            if len(msgs) > len(display_msgs):
+                header_note += f"_Показаны последние {len(display_msgs)} из {len(msgs)} сообщений:_"
+            else:
+                header_note += f"_История диалога ({len(msgs)} сообщ.):_"
+            send_md(chat, header_note)
+
+            for m_item in display_msgs:
+                role = m_item.get("role")
+                content = m_item.get("content") or ""
+                images = m_item.get("images") or []
+
+                if role == "user":
+                    for img_url in images:
+                        try:
+                            fpath = gemini.download_web_image(img_url)
+                            if fpath and fpath.is_file():
+                                tg.upload("sendPhoto", {"photo": fpath}, chat_id=chat.id,
+                                          caption="👤 **Вы (фото к вопросу):**")
+                        except Exception as e:
+                            log("send user photo error:", e)
+                    if content:
+                        send_md(chat, f"👤 **Вы:**\n\n{content}")
+
+                elif role == "assistant":
+                    if content:
+                        send_md(chat, f"♊ **Gemini:**\n\n{content}")
+                    for img_url in images:
+                        try:
+                            fpath = gemini.download_web_image(img_url)
+                            if fpath and fpath.is_file():
+                                tg.upload("sendPhoto", {"photo": fpath}, chat_id=chat.id,
+                                          caption="♊ **Gemini (рисунок / чертёж):**")
+                        except Exception as e:
+                            log("send assistant photo error:", e)
+
+            loaded_text = (
+                f"✅ **Диалог готов к продолжению!**\n"
+                f"«{md_escape(found_title)}» · {len(msgs)} сообщ. в памяти.\n\n"
+                "✍️ **Пишите вопрос прямо сюда** — бот продолжит диалог с учётом всей истории и решений!"
+            )
+            send_md(chat, loaded_text,
+                    markup={"inline_keyboard": [
+                        [btn("🔁 Ещё раз", "regen"), btn("🆕 Новый диалог", "new")],
+                        [btn("‹ Все веб-чаты", "gw:list"), btn("⚙️ Настройки", "settings")],
                     ]})
             return f"Загружен: {short(found_title, 20)}"
         except Exception as e:

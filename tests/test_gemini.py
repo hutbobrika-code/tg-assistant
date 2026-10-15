@@ -239,3 +239,61 @@ class GeminiFlowTest(FlowBase):
         self.assertIn("gw:list", all_datas)
         self.assertIn("gw:cur", all_datas)
 
+    def test_clean_gemini_text(self):
+        import gemini
+        raw = (
+            "```python?code_reference&code_event_index=1\nimport math\n```\n"
+            "[http://googleusercontent.com/generated_image/861]\n"
+            "Рисунок к задаче[cite: 1][file-tag: code-0-123]."
+        )
+        cleaned = gemini.clean_gemini_text(raw)
+        self.assertIn("```python\nimport math\n```", cleaned)
+        self.assertNotIn("?code_reference", cleaned)
+        self.assertNotIn("generated_image", cleaned)
+        self.assertNotIn("[cite: 1]", cleaned)
+        self.assertNotIn("[file-tag:", cleaned)
+
+    def test_gemini_open_web_chat_with_images(self):
+        old_list = bot.gemini.list_web_chats
+        old_get = bot.gemini.get_web_chat
+        old_dl = bot.gemini.download_web_image
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as tmp_img:
+            tmp_img.write(b"fake image data")
+            tmp_img.flush()
+
+            bot.gemini.list_web_chats = lambda limit=50: [{"id": "c_stereo", "title": "Стереометрия"}]
+            bot.gemini.get_web_chat = lambda cid: {
+                "id": cid,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Реши задачу с рисунка",
+                        "images": ["https://lh3.googleusercontent.com/gg/fake_user_img"]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Ответ: S = 12",
+                        "images": ["https://lh3.googleusercontent.com/gg/fake_asst_img"]
+                    }
+                ]
+            }
+            bot.gemini.download_web_image = lambda url, dest=None: Path(tmp_img.name)
+
+            try:
+                toast = bot.on_button(self.chat, 502, "gw:o:c_stereo")
+                self.assertIn("Загружен", toast)
+                st = self.chat.st
+                gem_st = st.get("gemini", {})
+                self.assertEqual(gem_st["cid"], "c_stereo")
+                self.assertEqual(len(gem_st["messages"]), 2)
+
+                # Verify that photos were uploaded to Telegram
+                uploads = [call for call in self.tg.calls if call[1] == "sendPhoto"]
+                self.assertTrue(len(uploads) >= 2)
+            finally:
+                bot.gemini.list_web_chats = old_list
+                bot.gemini.get_web_chat = old_get
+                bot.gemini.download_web_image = old_dl
+
+
