@@ -2316,10 +2316,13 @@ def cookie_keeper_loop():
     db_file = Path("data/gemini.db")
     enc_file = Path("state/gemini.db.enc")
 
-    time.sleep(30)
+    time.sleep(15)
+    first_run = True
     while True:
         try:
-            time.sleep(900)  # Check every 15 minutes
+            if not first_run:
+                time.sleep(600)  # Check every 10 minutes
+            first_run = False
             if not db_file.exists():
                 continue
 

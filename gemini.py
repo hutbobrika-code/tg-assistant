@@ -185,6 +185,8 @@ class GeminiTurn:
 
     def _save_data_images(self, text):
         """Find data:image/...;base64,... in text, save to workdir/uploads, replace with relative link."""
+        if "data:image/" not in text:
+            return text
         uploads = self.workdir / "uploads"
         uploads.mkdir(parents=True, exist_ok=True)
 
@@ -198,18 +200,58 @@ class GeminiTurn:
                 ext = ".webp"
             elif "gif" in mime:
                 ext = ".gif"
-            filename = f"gemini_{int(time.time() * 1000)}{ext}"
+            filename = f"gemini_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}{ext}"
             target = uploads / filename
             try:
                 target.write_bytes(base64.b64decode(b64_data))
                 rel_path = f"uploads/{filename}"
-                return f"![Сгенерированное изображение]({rel_path})"
+                return f"\n\n![Сгенерированное изображение]({rel_path})\n\n"
             except Exception as e:
                 log("gemini save data image error:", e)
                 return match.group(0)
 
-        pattern = r"!\[[^\]]*\]\(data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)\)"
+        pattern = r"(?:!\[[^\]]*\]\()?data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)\)?"
         return re.sub(pattern, repl, text)
+
+    def _resolve_google_images(self, text):
+        """Find http://googleusercontent.com/image_generation_content/... or generated_image/...
+        and download the real high-res image from Google CDN to workdir/uploads, replacing with relative link."""
+        pattern = r'\[?(?:https?:\/\/)?googleusercontent\.com\/(?:image_generation_content|generated_image)\/[a-zA-Z0-9_/-]+\]?'
+        matches = list(re.finditer(pattern, text))
+        if not matches:
+            return text
+
+        uploads = self.workdir / "uploads"
+        uploads.mkdir(parents=True, exist_ok=True)
+
+        try:
+            chats = list_web_chats(limit=3)
+            found_images = []
+            for c in chats:
+                chat_data = get_web_chat(c["id"])
+                for msg in reversed(chat_data.get("messages", [])):
+                    if msg.get("role") == "assistant" and msg.get("images"):
+                        found_images.extend(msg["images"])
+                if found_images:
+                    break
+
+            for i, match in enumerate(matches):
+                if i < len(found_images):
+                    img_url = found_images[i]
+                    dest = uploads / f"gemini_gen_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}_{i}.jpg"
+                    f = download_web_image(img_url, dest=dest)
+                    if f and f.is_file():
+                        rel_path = f"uploads/{f.name}"
+                        text = text.replace(match.group(0), f"\n\n![Сгенерированное изображение]({rel_path})\n\n")
+                    else:
+                        text = text.replace(match.group(0), "")
+                else:
+                    text = text.replace(match.group(0), "")
+        except Exception as e:
+            log("resolve_google_images error:", e)
+            for m in matches:
+                text = text.replace(m.group(0), "")
+        return re.sub(r"\n{3,}", "\n\n", text).strip()
 
     def _run(self):
         now_ms = int(time.time() * 1000)
@@ -340,6 +382,7 @@ class GeminiTurn:
                         self.parts["t1"]["time"]["end"] = now_final
                     # Post-process image tags
                     self.parts["t1"]["text"] = self._save_data_images(self.parts["t1"]["text"])
+                    self.parts["t1"]["text"] = self._resolve_google_images(self.parts["t1"]["text"])
             self.done.set()
             self.on_change()
 
@@ -504,10 +547,10 @@ def clean_gemini_text(text):
         return ""
     text = re.sub(r"```([a-zA-Z0-9_-]+)\?[^\n]*", r"```\1", text)
     text = re.sub(r"```\?[^\n]*", "```", text)
-    text = re.sub(r"\[http://googleusercontent\.com/generated_image/\d+\]", "", text)
+    text = re.sub(r"\[?(?:https?:\/\/)?googleusercontent\.com\/(?:image_generation_content|generated_image)\/[a-zA-Z0-9_/-]+\]?", "", text)
     text = re.sub(r"\[file-tag:[^\]]+\]", "", text)
     text = re.sub(r"\[cite:\s*\d+\]", "", text)
-    return text.strip()
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def download_web_image(url, cookie_str=None, dest=None):

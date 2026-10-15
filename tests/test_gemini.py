@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import gemini
 from gemini import GEMINI_MODELS, GeminiRouter, extract_prompt_and_images
 import bot
 from test_flows import FlowBase, job
@@ -295,5 +296,47 @@ class GeminiFlowTest(FlowBase):
                 bot.gemini.list_web_chats = old_list
                 bot.gemini.get_web_chat = old_get
                 bot.gemini.download_web_image = old_dl
+
+    def test_save_data_images(self):
+        with tempfile.TemporaryDirectory() as td:
+            turn = gemini.GeminiTurn("http://127.0.0.1:9999", "k", "m", [], td)
+            b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            raw = f"Вот картинка: data:image/png;base64,{b64}"
+            res = turn._save_data_images(raw)
+            self.assertIn("![Сгенерированное изображение](uploads/gemini_", res)
+            self.assertNotIn("data:image/png", res)
+            # Verify file exists
+            files = list((Path(td) / "uploads").glob("gemini_*.png"))
+            self.assertEqual(len(files), 1)
+
+    def test_resolve_google_images(self):
+        with tempfile.TemporaryDirectory() as td:
+            turn = gemini.GeminiTurn("http://127.0.0.1:9999", "k", "m", [], td)
+            old_list = gemini.list_web_chats
+            old_get = gemini.get_web_chat
+            old_dl = gemini.download_web_image
+
+            with tempfile.NamedTemporaryFile(suffix=".jpg") as tmp_img:
+                tmp_img.write(b"fake cat image")
+                tmp_img.flush()
+
+                gemini.list_web_chats = lambda limit=3: [{"id": "c_cat", "title": "Кот"}]
+                gemini.get_web_chat = lambda cid: {
+                    "id": cid,
+                    "messages": [
+                        {"role": "assistant", "images": ["https://lh3.googleusercontent.com/gg/fake_cat"]}
+                    ]
+                }
+                gemini.download_web_image = lambda url, dest=None: Path(tmp_img.name)
+
+                try:
+                    raw = "Вот сгенерированный кот:\n\nhttp://googleusercontent.com/image_generation_content/0_851"
+                    res = turn._resolve_google_images(raw)
+                    self.assertIn("![Сгенерированное изображение](uploads/", res)
+                    self.assertNotIn("image_generation_content", res)
+                finally:
+                    gemini.list_web_chats = old_list
+                    gemini.get_web_chat = old_get
+                    gemini.download_web_image = old_dl
 
 
