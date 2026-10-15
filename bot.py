@@ -12,9 +12,12 @@ import json
 import mimetypes
 import os
 import re
+import sqlite3
+import subprocess
 import threading
 import time
 import traceback
+import urllib.request
 from collections import OrderedDict
 from pathlib import Path
 from queue import Empty, Queue
@@ -2146,6 +2149,97 @@ def event_loop():
         dispatch(ev)
 
 
+def cookie_keeper_loop():
+    """Background keeper: periodically rotates Google cookies via gemini-web2api router,
+    checkpoints SQLite WAL to disk, and pushes updated state to GitHub so sessions never die."""
+    state_key = os.environ.get("STATE_KEY")
+    if not state_key:
+        return
+    admin_url = os.environ.get("GEMINI_ADMIN_URL", "http://127.0.0.1:8083")
+    db_file = Path("data/gemini.db")
+    enc_file = Path("state/gemini.db.enc")
+
+    time.sleep(30)
+    while True:
+        try:
+            time.sleep(900)  # Check every 15 minutes
+            if not db_file.exists():
+                continue
+
+            # 1. Trigger rotate via router admin API
+            try:
+                req = urllib.request.Request(
+                    f"{admin_url}/admin/api/cookies/1/rotate",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    resp_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    if resp_data.get("ok"):
+                        log("[cookie-keeper] Rotated Google session:", resp_data.get("refreshed"))
+            except Exception as e:
+                log("[cookie-keeper] router rotate ping:", e)
+
+            # 2. Flush SQLite WAL frames into data/gemini.db
+            try:
+                con = sqlite3.connect(str(db_file))
+                con.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                row = con.execute("SELECT cookie FROM accounts WHERE status='enabled' ORDER BY id DESC LIMIT 1").fetchone()
+                con.close()
+            except Exception as e:
+                log("[cookie-keeper] wal checkpoint error:", e)
+                continue
+
+            if not row or not row[0]:
+                continue
+            cur_cookie = row[0]
+
+            # 3. Check if current cookie differs from committed state.enc
+            needs_save = True
+            tmp_chk = Path(f"/tmp/chk_gemini_{int(time.time())}.db")
+            if enc_file.exists():
+                try:
+                    cmd_dec = ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "100000", "-salt",
+                               "-pass", "env:STATE_KEY", "-in", str(enc_file), "-out", str(tmp_chk)]
+                    r_dec = subprocess.run(cmd_dec, env=dict(os.environ, STATE_KEY=state_key), capture_output=True)
+                    if r_dec.returncode == 0:
+                        con2 = sqlite3.connect(str(tmp_chk))
+                        old_row = con2.execute("SELECT cookie FROM accounts WHERE status='enabled' ORDER BY id DESC LIMIT 1").fetchone()
+                        con2.close()
+                        if old_row and old_row[0] == cur_cookie:
+                            needs_save = False
+                except Exception:
+                    pass
+                finally:
+                    if tmp_chk.exists():
+                        try:
+                            tmp_chk.unlink()
+                        except OSError:
+                            pass
+
+            if needs_save:
+                enc_file.parent.mkdir(parents=True, exist_ok=True)
+                cmd_enc = ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "100000", "-salt",
+                           "-pass", "env:STATE_KEY", "-in", str(db_file), "-out", str(enc_file)]
+                r_enc = subprocess.run(cmd_enc, env=dict(os.environ, STATE_KEY=state_key), capture_output=True)
+                if r_enc.returncode == 0:
+                    subprocess.run(["git", "config", "user.name", "assistant-bot"], capture_output=True)
+                    subprocess.run(["git", "config", "user.email", "assistant-bot@users.noreply.github.com"], capture_output=True)
+                    subprocess.run(["git", "add", "state/gemini.db.enc"], capture_output=True)
+                    commit_msg = f"auto-renew: gemini session cookies ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())})"
+                    diff = subprocess.run(["git", "diff", "--staged", "--quiet"])
+                    if diff.returncode != 0:
+                        subprocess.run(["git", "commit", "-m", commit_msg], capture_output=True)
+                        subprocess.run(["git", "pull", "--rebase"], capture_output=True)
+                        push_r = subprocess.run(["git", "push", "origin", "main"], capture_output=True)
+                        if push_r.returncode == 0:
+                            log("[cookie-keeper] Successfully persisted renewed Google session to GitHub!")
+                        else:
+                            log("[cookie-keeper] git push error:", push_r.stderr.decode()[:200])
+        except Exception:
+            log("[cookie-keeper] unexpected error:", traceback.format_exc())
+
+
 def setup_profile():
     tg("setMyCommands", commands=[{"command": c, "description": d} for c, d in [
         ("new", "🆕 Новый диалог"), ("stop", "⏹ Остановить ответ"), ("settings", "⚙️ Модель и настройки"),
@@ -2172,6 +2266,7 @@ def main():
         f"доступ: {sorted(ALLOWED) or 'никому'}")
     setup_profile()
     threading.Thread(target=event_loop, daemon=True).start()
+    threading.Thread(target=cookie_keeper_loop, daemon=True).start()
     offset = None
     shift_until = None
     shift_min = os.environ.get("SHIFT_MINUTES")

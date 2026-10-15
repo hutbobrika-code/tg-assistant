@@ -100,6 +100,9 @@ jobs:
         env:
           STATE_KEY: ${{ secrets.STATE_KEY }}
         run: |
+          kill -TERM $(pgrep gemini-web2api-go) 2>/dev/null || true
+          sleep 2
+          sqlite3 data/gemini.db "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
           mkdir -p state
           if [ -f state.json ] && [ -n "$STATE_KEY" ]; then
             openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt -pass env:STATE_KEY -in state.json -out state/state.enc
