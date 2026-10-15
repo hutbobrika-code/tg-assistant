@@ -398,8 +398,15 @@ class GeminiFlowTest(FlowBase):
 
         # Test view renderers
         md, kb = bot.limits_view(self.chat)
-        self.assertIn("Лимиты и статус Gemini", md)
+        self.assertIn("Лимиты на использование Gemini", md)
+        self.assertIn("Текущее использование", md)
         self.assertTrue(len(kb["inline_keyboard"]) >= 3)
+
+        # Test progress bar
+        bar_97 = bot.make_progress_bar(97, 12)
+        self.assertTrue(bar_97.startswith("██████████"))
+        bar_16 = bot.make_progress_bar(16, 12)
+        self.assertTrue("░" in bar_16)
 
         md, kb = bot.video_guide_view(self.chat)
         self.assertIn("Google Veo 2", md)

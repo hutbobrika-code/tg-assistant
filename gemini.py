@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import OrderedDict
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from tg import log
@@ -783,11 +784,129 @@ def generate_video(prompt, base_url="http://127.0.0.1:8083/v1", api_key="sk-gemi
     raise RuntimeError("Время ожидания генерации видео истекло (более 6 минут)")
 
 
-def get_gemini_limits_info(db_path="data/gemini.db"):
-    """Read account status, cookies, and 24h usage statistics from SQLite db."""
+_USAGE_CACHE = {"data": None, "time": 0}
+
+
+def format_usage_reset_time(iso_str, is_weekly=False):
+    """Format ISO timestamp from Google into Russian local time (e.g. '19:52' or '20 окт. в 10:52')."""
+    if not iso_str:
+        return "—"
+    try:
+        clean_iso = iso_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean_iso)
+        # UTC+3 timezone (Moscow / user's local timezone)
+        tz_offset = timezone(timedelta(hours=3))
+        dt_local = dt.astimezone(tz_offset)
+        months = ["", "янв.", "фев.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сен.", "окт.", "нояб.", "дек."]
+        if is_weekly:
+            return f"{dt_local.day} {months[dt_local.month]} в {dt_local.strftime('%H:%M')}"
+        return f"{dt_local.strftime('%H:%M')}"
+    except Exception:
+        return iso_str[:16]
+
+
+def fetch_gemini_web_usage(cookie_str=None, force=False):
+    """Fetch real-time usage metrics and reset timestamps directly from Gemini GraphQL (gemini.google.com/usage)."""
+    global _USAGE_CACHE
+    now = time.time()
+    if not force and _USAGE_CACHE["data"] and (now - _USAGE_CACHE["time"] < 20):
+        return _USAGE_CACHE["data"]
+
+    cookie = cookie_str or get_active_cookie()
+    if not cookie:
+        return None
+    try:
+        auth_header = make_sapisid_hash(cookie)
+        query_sig = "2/dWbCvkVB0X16r9NPnxifeOAAqdCqMf0xeWvau9yPy7g="
+        variables = {
+            "g1Request": {
+                "entrypoints": [
+                    "GEMINI_USAGE_SETTINGS_UPGRADE_BANNER",
+                    "GEMINI_USAGE_SETTINGS_AI_CREDITS_UPSELL_CARD",
+                    "GEMINI_USAGE_SETTINGS_UPGRADE_AND_CREDITS_BANNER"
+                ]
+            },
+            "workspaceRequest": {
+                "recommendationsForSurfaceRequests": [
+                    {
+                        "recommendationSurface": {
+                            "rpOnramp": "GEMINI_CHAT_USAGE_LIMITS_UPSELL",
+                            "version": "1"
+                        },
+                        "maxRecommendationCount": 1
+                    }
+                ]
+            }
+        }
+        base_url = "https://gemini.google.com/_/BardChatUi/graphql/schemas/GEMINI_WEB_GRAPHQL/executeQuery"
+        params = {
+            "query_signature": query_sig,
+            "variables": json.dumps(variables)
+        }
+        url = f"{base_url}?{urllib.parse.urlencode(params)}"
+        headers = {
+            "Cookie": cookie,
+            "Authorization": auth_header,
+            "Accept": "application/json",
+            "Origin": "https://gemini.google.com",
+            "Referer": "https://gemini.google.com/usage",
+            "X-Same-Domain": "1",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+        }
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.load(resp)
+            if isinstance(data, list) and len(data) > 0:
+                usage_info = (
+                    data[0].get("data", {})
+                    .get("viewer", {})
+                    .get("rpcs", {})
+                    .get("getUsageInfo", {})
+                )
+                if usage_info:
+                    tier = usage_info.get("subscriptionTier", "PRO")
+                    pools = usage_info.get("pools") or []
+                    cur_p = next((p for p in pools if p.get("poolType") == "GXU_FIVE_HOURLY"), None)
+                    wk_p = next((p for p in pools if p.get("poolType") == "GXU_WEEKLY"), None)
+
+                    cur_pct = round((cur_p.get("percentageUsed") or 0) * 100) if cur_p else None
+                    cur_iso = cur_p.get("gxu", {}).get("windowRefreshesAt") if cur_p else None
+
+                    wk_pct = round((wk_p.get("percentageUsed") or 0) * 100) if wk_p else None
+                    wk_iso = wk_p.get("gxu", {}).get("windowRefreshesAt") if wk_p else None
+
+                    res = {
+                        "tier": "PRO" if tier in ("TIER1", "PRO") else tier,
+                        "current": {
+                            "percent": cur_pct,
+                            "reset_iso": cur_iso,
+                            "reset_time": format_usage_reset_time(cur_iso, is_weekly=False)
+                        },
+                        "weekly": {
+                            "percent": wk_pct,
+                            "reset_iso": wk_iso,
+                            "reset_time": format_usage_reset_time(wk_iso, is_weekly=True)
+                        },
+                        "use_overage": usage_info.get("useOverageAiCredits", False),
+                        "updated_at": "только что"
+                    }
+                    _USAGE_CACHE = {"data": res, "time": now}
+                    return res
+    except Exception as e:
+        log("fetch_gemini_web_usage error:", e)
+    return _USAGE_CACHE.get("data")
+
+
+def get_gemini_limits_info(db_path="data/gemini.db", force_web=False):
+    """Read account status, cookies, 24h usage statistics from SQLite db, and live web usage metrics."""
+    web_usage = fetch_gemini_web_usage(force=force_web)
+    plan_name = "Google One AI Premium (Gemini Advanced / Ultra)"
+    if web_usage and web_usage.get("tier") == "PRO":
+        plan_name = "Google One AI Premium (PRO / Gemini Ultra)"
+
     info = {
         "email": "artur.hodzhojan@gmail.com",
-        "plan": "Google One AI Premium (Gemini Advanced / Ultra)",
+        "plan": plan_name,
         "account_status": "enabled",
         "cookie_count": 12,
         "cookie_health": "ok",
@@ -797,6 +916,7 @@ def get_gemini_limits_info(db_path="data/gemini.db"):
         "success_24h": 0,
         "avg_ms_24h": 0,
         "by_model": {},
+        "web_limits": web_usage,
         "quotas": [
             {"model": "Gemini 4 Argon (Ultra/Thinking)", "quota": "50 запросов / сутки", "status": "🟢 Доступно"},
             {"model": "Gemini 3.1 Pro (Thinking)", "quota": "Безлимитно (Extended)", "status": "🟢 Доступно"},
@@ -948,8 +1068,11 @@ class GeminiRouter:
     def generate_video(self, prompt, on_progress=None):
         return generate_video(prompt, base_url=self.base_url, api_key=self.api_key, workdir=self.workdir, on_progress=on_progress)
 
-    def get_limits_info(self, db_path="data/gemini.db"):
-        return get_gemini_limits_info(db_path=db_path)
+    def get_limits_info(self, db_path="data/gemini.db", force_web=False):
+        return get_gemini_limits_info(db_path=db_path, force_web=force_web)
+
+    def fetch_web_usage(self, force=True):
+        return fetch_gemini_web_usage(force=force)
 
     def start(self, parts, model_id, effort=None, dialog=None, on_change=None):
         prompt_text, images = extract_prompt_and_images(parts)

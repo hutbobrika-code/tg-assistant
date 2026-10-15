@@ -1585,37 +1585,81 @@ def settings_view(chat):
     return md, {"inline_keyboard": rows}
 
 
+def make_progress_bar(pct, length=12):
+    if pct is None:
+        return "░" * length
+    pct = max(0, min(100, pct))
+    filled = int(round(pct / 100 * length))
+    empty = length - filled
+    return "█" * filled + "░" * empty
+
+
 def limits_view(chat):
     info = gemini.get_limits_info()
+    web = info.get("web_limits")
+
     email = info.get("email", "artur.hodzhojan@gmail.com")
-    plan = info.get("plan", "Google One AI Premium (Gemini Advanced / Ultra)")
+    tier_label = web.get("tier", "PRO") if web else "PRO"
+    plan = info.get("plan", f"Google One AI Premium ({tier_label})")
     status = "🟢 Онлайн (Активен)" if info.get("account_status") == "enabled" else "⚠️ Требует проверки"
     cookies_str = f"12/12 ({info.get('cookie_health', 'ok')})"
     last_ok = ago(info["last_ok_at"]) if info.get("last_ok_at") else "недавно"
+
+    lines = [
+        f"## 📊 Лимиты на использование Gemini · `{tier_label}`",
+        "_От лимитов тарифного плана зависит, как часто вы можете использовать Gemini за определенный период._",
+        "",
+    ]
+
+    if web:
+        cur = web.get("current") or {}
+        wk = web.get("weekly") or {}
+        c_pct = cur.get("percent")
+        c_reset = cur.get("reset_time", "—")
+        w_pct = wk.get("percent")
+        w_reset = wk.get("reset_time", "—")
+
+        c_bar = make_progress_bar(c_pct, 12)
+        w_bar = make_progress_bar(w_pct, 12)
+
+        lines.extend([
+            f"### ⏱ Текущее использование: **Использовано {c_pct} %**",
+            f"`[{c_bar}] {c_pct}%`",
+            f"> ⏳ _Лимит обновится в {c_reset}_",
+            "",
+            f"### 📅 Недельный лимит: **Использовано {w_pct} %**",
+            f"`[{w_bar}] {w_pct}%`",
+            f"> ⏳ _Лимит обновится {w_reset}_",
+            "",
+        ])
+    else:
+        lines.extend([
+            "> ⚠️ _Данные официальных лимитов обновляются..._",
+            "",
+        ])
 
     reqs = info.get("requests_24h", 0)
     succ = info.get("success_24h", 0)
     rate = f"{round((succ / reqs) * 100)}%" if reqs > 0 else "100%"
     avg_s = f"{info.get('avg_ms_24h', 0)} с" if info.get("avg_ms_24h") else "—"
 
-    lines = [
-        "## 📊 Лимиты и статус Gemini",
+    lines.extend([
+        "### ⚙️ Параметры подключения:",
+        f"- 👤 **Аккаунт:** `{email}`",
+        f"- 💎 **Тариф:** {plan}",
+        f"- ⚡ **Сессия:** {status}",
+        f"- 🛡 **Cookie Pool:** {cookies_str} · {last_ok}",
+        f"- 🔄 **Авто-ротация:** каждые 10 мин (GitHub Actions Runner)",
         "",
-        f"👤 **Аккаунт:** `{email}`",
-        f"💎 **Тариф:** {plan}",
-        f"⚡ **Статус сессии:** {status}",
-        f"🛡 **Cookie Pool:** {cookies_str} · проверен {last_ok}",
-        f"🔄 **Авто-ротация:** каждые 10 мин (GitHub Actions Runner)",
-        "",
-        "### ♊ Доступные модели и квоты:",
-    ]
+        "### ♊ Квоты моделей Gemini:",
+    ])
     for q in info.get("quotas", []):
         lines.append(f"- {q['status']} **{q['model']}** — `{q['quota']}`")
 
     lines.extend([
         "",
-        "### 📈 Статистика запросов за 24 часа:",
-        f"- Всего запросов: **{reqs}** (успешных: **{succ}** · успех **{rate}**)",
+        "### 📈 Статистика бота за 24 часа:",
+        f"- Всего запросов: **{reqs}** (успешных: **{succ}** · {rate})",
         f"- Среднее время ответа (TTFB): **{avg_s}**",
     ])
     by_m = info.get("by_model", {})
@@ -1625,7 +1669,7 @@ def limits_view(chat):
 
     md = "\n".join(lines)
     rows = [
-        [btn("🔄 Обновить статус", "limits"), btn("⚙️ Модели", "models")],
+        [btn("🔄 Обновить лимиты", "limits"), btn("⚙️ Модели", "models")],
         [btn("🎨 Сгенерировать фото", "prompt_guide:img"), btn("🎬 Создать видео", "prompt_guide:vid")],
         [btn("🎵 Создать музыку", "prompt_guide:mus"), btn("🔬 Deep Research", "prompt_guide:dr")],
         [btn("‹ В настройки", "settings"), btn("✖️ Закрыть", "close")],
@@ -2218,7 +2262,13 @@ def on_button(chat, mid, data):
     if data == "settings":
         show_screen(chat, settings_view, mid)
     elif data == "limits":
+        if gemini.available():
+            try:
+                gemini.get_limits_info(force_web=True)
+            except Exception:
+                pass
         show_screen(chat, limits_view, mid)
+        return "Лимиты обновлены"
     elif data == "prompt_guide:img":
         show_screen(chat, image_guide_view, mid)
     elif data == "prompt_guide:vid":
