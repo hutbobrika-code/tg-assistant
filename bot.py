@@ -2653,15 +2653,24 @@ def cookie_keeper_loop():
 
 def setup_profile():
     tg("setMyCommands", commands=[{"command": c, "description": d} for c, d in [
-        ("new", "🆕 Новый диалог"), ("stop", "⏹ Остановить ответ"), ("settings", "⚙️ Модель и настройки"),
-        ("chats", "♊ Веб-чаты Gemini"), ("sessions", "🗂 Прошлые диалоги"), ("files", "📁 Файлы агента"),
+        ("image", "🎨 Генерация фото"),
+        ("video", "🎬 Генерация видео (Veo 2)"),
+        ("music", "🎵 Генерация музыки (Lyria)"),
+        ("deepresearch", "🔬 Deep Research (4 Argon)"),
+        ("limits", "📊 Лимиты и статус Gemini"),
+        ("chats", "♊ Веб-чаты Gemini"),
+        ("new", "🆕 Новый диалог"),
+        ("settings", "⚙️ Модель и настройки"),
+        ("stop", "⏹ Остановить ответ"),
+        ("sessions", "🗂 Прошлые диалоги"),
+        ("files", "📁 Файлы агента"),
         ("help", "❓ Как пользоваться"),
     ]])
-    desc = ("Агент OpenCode на модели Muse Spark 1.3: думает, пишет и запускает код, рисует графики, "
-            "разбирает фото и файлы. Формулы и таблицы — прямо в чате.")
+    desc = ("AI-ассистент с поддержкой Gemini 4 Argon, Veo 2, Lyria 3.5 и OpenCode: "
+            "генерация видео, музыки, картинок, глубокие исследования, код, таблицы и файлы.")
     if (tg("getMyDescription").get("result") or {}).get("description") != desc:
         tg("setMyDescription", description=desc)
-    short_desc = "Muse Spark 1.3 через OpenCode: код, формулы, графики и файлы"
+    short_desc = "Gemini 4 Argon, Veo 2 & OpenCode: видео, музыка, фото, код и исследования"
     if (tg("getMyShortDescription").get("result") or {}).get("short_description") != short_desc:
         tg("setMyShortDescription", short_description=short_desc)
 
