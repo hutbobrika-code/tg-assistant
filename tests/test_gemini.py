@@ -35,6 +35,22 @@ class MockGeminiHandler(BaseHTTPRequestHandler):
         if self.path == "/v1/chat/completions":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if body.get("model") in ("gemini-music", "gemini/gemini-music") and not body.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                fake_b64 = "AAAA"
+                res = {
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": f"data:audio/m4a;base64,{fake_b64}"
+                        }
+                    }]
+                }
+                self.wfile.write(json.dumps(res).encode("utf-8"))
+                return
+
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -473,6 +489,109 @@ class GeminiFlowTest(FlowBase):
         self.assertNotIn("Cookie Pool", md)
         self.assertNotIn("Квоты моделей", md)
         self.assertNotIn("Статистика бота за 24 часа", md)
+
+    def test_format_gemini_error(self):
+        # 1. Timeout
+        err_to = gemini.format_gemini_error("Connection timed out", "")
+        self.assertIn("Время ожидания ответа от Google Gemini истекло", err_to)
+        self.assertIn("4 Argon", err_to)
+        self.assertIn("3.8 Flash", err_to)
+
+        # 2. Cookie / SNlM0e
+        err_ck = gemini.format_gemini_error("502 Bad Gateway", "no SNlM0e in page (cookie expired)")
+        self.assertIn("Сессия Google Gemini обновляется", err_ck)
+        self.assertIn("GitHub Actions", err_ck)
+
+        # 3. Artifact delay / Lyria
+        err_art = gemini.format_gemini_error("media generation succeeded but artifact retrieval failed: hNvQHb", "")
+        self.assertIn("Google Gemini создал медиафайл", err_art)
+
+        # 4. Connection refused
+        err_cr = gemini.format_gemini_error("[Errno 111] Connection refused", "")
+        self.assertIn("Локальный шлюз Gemini Web2API временно недоступен", err_cr)
+
+    def test_friendly_gemini_error(self):
+        self.assertIn("Время ожидания", bot.friendly_gemini_error("Gemini connection error: timed out"))
+        self.assertIn("Сессия Google Gemini обновляется", bot.friendly_gemini_error("upstream error: cookie expired"))
+        self.assertIn("Медиафайл создаётся", bot.friendly_gemini_error("media generation succeeded but artifact retrieval failed"))
+
+    def test_activity_md_media_and_thinking_progress(self):
+        # Default reasoning
+        parts_default = [{"type": "reasoning", "text": "Analyzing the theorem..."}]
+        self.assertEqual(bot.activity_md(parts_default), "💭 **Размышляю**")
+
+        # Video progress
+        parts_vid = [{"type": "reasoning", "text": "🎬 Генерация видео нейросетью Veo 2... (42 сек)"}]
+        self.assertIn("🎬", bot.activity_md(parts_vid))
+        self.assertIn("Veo 2", bot.activity_md(parts_vid))
+
+        # Music progress
+        parts_mus = [{"type": "reasoning", "text": "🎵 Синтез музыки нейросетью Google Lyria... (15 сек)"}]
+        self.assertIn("🎵", bot.activity_md(parts_mus))
+        self.assertIn("Google Lyria", bot.activity_md(parts_mus))
+
+        # Deep thinking retry progress
+        parts_retry = [{"type": "reasoning", "text": "⏳ Флагманская модель 4 Argon завершает рассуждения..."}]
+        self.assertIn("⏳", bot.activity_md(parts_retry))
+        self.assertIn("4 Argon", bot.activity_md(parts_retry))
+
+    def test_generate_music_direct_base64(self):
+        with tempfile.TemporaryDirectory() as td:
+            mus_path, desc = gemini.generate_music(
+                "Upbeat synthwave track",
+                base_url=f"http://127.0.0.1:{self.port}/v1",
+                api_key="test-key",
+                workdir=td,
+            )
+            self.assertTrue(mus_path.startswith("uploads/gemini_music_"))
+            self.assertTrue(mus_path.endswith(".m4a"))
+            created_file = Path(td) / mus_path
+            self.assertTrue(created_file.is_file())
+            self.assertEqual(created_file.read_bytes(), b"\x00\x00\x00")
+
+    def test_generate_music_web_polling(self):
+        with tempfile.TemporaryDirectory() as td:
+            with tempfile.NamedTemporaryFile(suffix=".m4a") as tmp_audio:
+                tmp_audio.write(b"fake audio data stream 1234567890" * 30)
+                tmp_audio.flush()
+
+                old_list = gemini.list_web_chats
+                old_get = gemini.get_web_chat
+                old_dl = gemini.download_web_media
+
+                gemini.list_web_chats = lambda limit=3: [{"id": "c_mus", "title": "Музыка"}]
+                gemini.get_web_chat = lambda cid: {
+                    "id": cid,
+                    "messages": [
+                        {"role": "assistant", "content": "Трек в стиле рок",
+                         "images": ["https://lh3.googleusercontent.com/gg/sample=m140"]}
+                    ]
+                }
+                gemini.download_web_media = lambda url, dest=None: Path(tmp_audio.name)
+
+                try:
+                    # Point to 404 URL so router returns 404/error, triggering web chat polling
+                    mus_path, desc = gemini.generate_music(
+                        "Rock riff",
+                        base_url="http://127.0.0.1:9999/v1",
+                        api_key="test-key",
+                        workdir=td,
+                    )
+                    self.assertTrue(mus_path.startswith("uploads/gemini_music_"))
+                    self.assertIn("Трек в стиле рок", desc)
+                finally:
+                    gemini.list_web_chats = old_list
+                    gemini.get_web_chat = old_get
+                    gemini.download_web_media = old_dl
+
+    def test_music_guide_view_layout(self):
+        md, kb = bot.music_guide_view(self.chat)
+        self.assertIn("Google Lyria", md)
+        rows = kb["inline_keyboard"]
+        # Verify 2 buttons per row for preset samples
+        self.assertEqual(len(rows[0]), 2)
+        self.assertEqual(len(rows[1]), 2)
+        self.assertEqual(len(rows[2]), 2)
 
 
 

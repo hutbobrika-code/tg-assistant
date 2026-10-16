@@ -526,6 +526,10 @@ def activity_md(parts):
         s = f"{icon} **{md_escape(short(text, 60))}**" if text else icon
         return s + (" " + code(lit, 50) if lit else "")
     if last and last["type"] == "reasoning" and not (last.get("time") or {}).get("end"):
+        txt = (last.get("text") or "").strip()
+        if txt and any(txt.startswith(pfx) for pfx in ("🎬", "🎵", "🎨", "🔬", "⏳")):
+            first_line = txt.splitlines()[0]
+            return f"**{md_escape(short(first_line, 80))}**"
         return "💭 **Размышляю**"
     if last and last["type"] == "text" and not (last.get("time") or {}).get("end"):
         return "✍️ **Пишу ответ**"
@@ -1075,6 +1079,27 @@ def friendly_claude_error(err):
     return err
 
 
+def friendly_gemini_error(err):
+    if not err:
+        return None
+    if isinstance(err, str):
+        low = err.lower()
+        if "cookie" in low or "snlm0e" in low or "not signed in" in low:
+            return ("⚠️ Сессия Google Gemini обновляется.\n\n"
+                    "GitHub Actions автоматически ротирует сессию каждые 10 минут. "
+                    "Попробуйте повторить запрос через минуту.")
+        if "timed out" in low or "timeout" in low:
+            return ("⏱️ Время ожидания ответа от Google Gemini истекло.\n\n"
+                    "Модель 4 Argon выполняет глубокие рассуждения — нажмите «🔁 Ещё раз» для повтора.")
+        if "media generation succeeded" in low or "artifact retrieval failed" in low or "hnvqhb" in low:
+            return ("🎵 Медиафайл создаётся на сервере Google Gemini.\n\n"
+                    "Нажмите «🔁 Ещё раз», чтобы забрать готовый результат.")
+        if "502" in low and ("upstream" in low or "bad gateway" in low):
+            return ("⚠️ Временная ошибка связи с серверами Google Gemini (502 Bad Gateway).\n\n"
+                    "Попробуйте нажать «🔁 Ещё раз».")
+    return err
+
+
 def claude_refs(st):
     """Session ids that dialogs still point at (their files must stay)."""
     refs = set()
@@ -1212,7 +1237,7 @@ class GeminiRun(Run):
             if not gem_st.get("title") and prompt_text:
                 gem_st["title"] = short(prompt_text, 40)
             save_state()
-        return parts, err
+        return parts, friendly_gemini_error(err)
 
     def regen_info(self):
         return {"gemini": True}
@@ -1668,24 +1693,30 @@ IMG_SAMPLES = [
     ("🐱 Кот-космонавт", "Рыжий кот в детализированном скафандре исследует поверхность Марса на фоне заката, фотореализм 8k"),
     ("🏙 Киберпанк мегаполис", "Футуристический мегаполис в дождливую ночь с неоновыми вывесками, летающими машинами и отражениями в лужах"),
     ("☕ Уютная кофейня", "Акварельная иллюстрация теплой уютной кофейни с книжными полками и мягким утренним светом"),
+    ("🐉 Изумрудный дракон", "Величественный восточный изумрудный дракон парит над заснеженными вершинами гор на рассвете, фэнтези арт"),
 ]
 
 VID_SAMPLES = [
     ("💧 Капли в slow-mo", "Крупный план: капли кристально чистой воды падают на гладкую водную гладь с волнами и брызгами, супер замедленная съемка"),
     ("🚀 Гиперпрыжок", "Космический корабль ускоряется и совершает гиперпространственный прыжок сквозь разноцветную туманность"),
     ("🌊 Штормовой маяк", "Мощные морские волны разбиваются о скалистый берег вокруг старинного светящегося маяка на закате"),
+    ("🏎 Ночной дрифт", "Спортивный неоновый суперкар скользит в дрифте по мокрому асфальту ночного мегаполиса, клубы дыма из-под колес"),
 ]
 
 MUS_SAMPLES = [
-    ("🕹 8-бит Аркада", "Бодрая энергичная мелодия в стиле 8-bit chiptune для ретро-аркадной игры с динамичным битом"),
-    ("☕ Lo-Fi Chill", "Расслабляющий спокойный Lo-Fi хип-хоп бит с теплым пианино, виниловым потрескиванием и мягким басом"),
     ("⚡ Синтвейв 80-х", "Драйвовый ретровейв/синтвейв 80-х с мощным аналоговым басом и неоновой атмосферой ночной трассы"),
+    ("☕ Lo-Fi Chill", "Расслабляющий спокойный Lo-Fi хип-хоп бит с теплым пианино, виниловым потрескиванием и мягким басом"),
+    ("🎸 Драйвовый Рок", "Энергичный рок-трек с мощными гитарными риффами, перегруженным басом и живыми ударными"),
+    ("🌌 Ambient Космос", "Глубокий атмосферный космический эмбиент с воздушными пэдами, мерцающими синтами и ощущением невесомости"),
+    ("🎹 Неоклассика", "Эмоциональная неоклассическая мелодия на акустическом рояле в сопровождении струнного оркестра"),
+    ("🕹 8-бит Аркада", "Бодрая энергичная мелодия в стиле 8-bit chiptune для ретро-аркадной игры с динамичным битом"),
 ]
 
 DR_SAMPLES = [
     ("🧠 Эволюция LLM 2026", "Архитектурные инновации в современных больших языковых моделях: сравнение MHA, MLA, MoE и подходов к рассуждениям (reasoning)"),
     ("⚡ EUV литография", "Анализ мирового рынка оборудования для фотолитографии, технологий High-NA EUV и перспектив полупроводниковой индустрии"),
     ("🔐 Постквантовая криптография", "Современные алгоритмы PQC (ML-KEM, SLH-DSA), переход на квантово-устойчивые стандарты безопасности и риски"),
+    ("🚀 Частная космонавтика", "Сравнительный анализ проектов многоразовых сверхтяжёлых ракет, орбитальной заправки и марсианских экспедиций на период до 2030 года"),
 ]
 
 
@@ -1696,7 +1727,15 @@ def image_guide_view(chat):
         "или нажмите на один из быстрых примеров ниже:\n\n"
         "Нейросеть Nano Banana / Imagen создаст качественную иллюстрацию и пришлёт её прямо в чат."
     )
-    rows = [[btn(label, f"do_prompt:img:{i}")] for i, (label, _) in enumerate(IMG_SAMPLES)]
+    rows = []
+    r = []
+    for i, (label, _) in enumerate(IMG_SAMPLES):
+        r.append(btn(label, f"do_prompt:img:{i}"))
+        if len(r) == 2:
+            rows.append(r)
+            r = []
+    if r:
+        rows.append(r)
     rows.append([btn("‹ В настройки", "settings"), btn("✖️ Отмена", "cancel_pending")])
     return md, {"inline_keyboard": rows}
 
@@ -1709,19 +1748,35 @@ def video_guide_view(chat):
         "Кинематографичная модель **Google Veo 2** сгенерирует плавный видеоролик в MP4 и отправит его вам как нативное видео в Telegram.\n\n"
         "⏱ *Время генерации обычно занимает от 1 до 2 минут.*"
     )
-    rows = [[btn(label, f"do_prompt:vid:{i}")] for i, (label, _) in enumerate(VID_SAMPLES)]
+    rows = []
+    r = []
+    for i, (label, _) in enumerate(VID_SAMPLES):
+        r.append(btn(label, f"do_prompt:vid:{i}"))
+        if len(r) == 2:
+            rows.append(r)
+            r = []
+    if r:
+        rows.append(r)
     rows.append([btn("‹ В настройки", "settings"), btn("✖️ Отмена", "cancel_pending")])
     return md, {"inline_keyboard": rows}
 
 
 def music_guide_view(chat):
     md = (
-        "## 🎵 Генерация музыки (Google Lyria 3.5)\n\n"
+        "## 🎵 Студия музыки Google Lyria 3.5\n\n"
         "✨ **Напишите в ответ жанр, настроение или описание трека**, "
         "или выберите один из музыкальных стилей ниже:\n\n"
-        "Модель **Google Lyria 3.5** синтезирует полноценный аудиотрек и отправит его в Telegram."
+        "Модель **Google Lyria 3.5** синтезирует полноценный аудиотрек и отправит его в Telegram с нативным аудиопроигрывателем."
     )
-    rows = [[btn(label, f"do_prompt:mus:{i}")] for i, (label, _) in enumerate(MUS_SAMPLES)]
+    rows = []
+    r = []
+    for i, (label, _) in enumerate(MUS_SAMPLES):
+        r.append(btn(label, f"do_prompt:mus:{i}"))
+        if len(r) == 2:
+            rows.append(r)
+            r = []
+    if r:
+        rows.append(r)
     rows.append([btn("‹ В настройки", "settings"), btn("✖️ Отмена", "cancel_pending")])
     return md, {"inline_keyboard": rows}
 
@@ -1733,7 +1788,15 @@ def deepresearch_guide_view(chat):
         "или выберите тему из готовых примеров ниже:\n\n"
         "Флагман **Gemini 4 Argon** с максимальной глубиной рассуждений проведёт структурированный всесторонний анализ темы с фактами, таблицами и выводами."
     )
-    rows = [[btn(label, f"do_prompt:dr:{i}")] for i, (label, _) in enumerate(DR_SAMPLES)]
+    rows = []
+    r = []
+    for i, (label, _) in enumerate(DR_SAMPLES):
+        r.append(btn(label, f"do_prompt:dr:{i}"))
+        if len(r) == 2:
+            rows.append(r)
+            r = []
+    if r:
+        rows.append(r)
     rows.append([btn("‹ В настройки", "settings"), btn("✖️ Отмена", "cancel_pending")])
     return md, {"inline_keyboard": rows}
 

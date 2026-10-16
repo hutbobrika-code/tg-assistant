@@ -209,6 +209,60 @@ def clean_gemini_text_and_extract_followups(text):
     return cleaned, followups
 
 
+def format_gemini_error(err, body=""):
+    """Convert technical Gemini API/HTTP/connection errors into clean Russian messages."""
+    err_str = str(err)
+    combined = f"{err_str} {body}".lower()
+
+    if "cookie" in combined or "snlm0e" in combined or "not signed in" in combined:
+        return (
+            "⚠️ Сессия Google Gemini обновляется.\n\n"
+            "GitHub Actions автоматически ротирует сессию каждые 10 минут. "
+            "Попробуйте повторить запрос через минуту."
+        )
+    if "timed out" in combined or "timeout" in combined or "deadline" in combined:
+        return (
+            "⏱️ Время ожидания ответа от Google Gemini истекло.\n\n"
+            "Флагманская модель 4 Argon выполняет глубокие рассуждения — нажмите «🔁 Ещё раз», "
+            "чтобы повторить запрос, или выберите модель 3.8 Flash для мгновенного ответа."
+        )
+    if "connection refused" in combined or "errno 111" in combined:
+        return (
+            "🔌 Локальный шлюз Gemini Web2API временно недоступен.\n\n"
+            "Сервис перезапускается на сервере."
+        )
+    if "429" in combined or "rate limit" in combined or "quota" in combined:
+        return (
+            "⏳ Исчерпан лимит запросов к Google Gemini на этот период.\n\n"
+            "Лимиты обновляются каждые несколько часов (см. раздел «📊 Лимиты»)."
+        )
+    if "media generation succeeded" in combined or "artifact retrieval failed" in combined or "hnvqhb" in combined:
+        return (
+            "🎵 Google Gemini создал медиафайл, но серверу потребовалось больше времени для его передачи.\n\n"
+            "Нажмите «🔁 Ещё раз» — обычно повторный запрос отдаётся мгновенно."
+        )
+    if "502" in combined or "bad gateway" in combined:
+        return (
+            "⚠️ Временная ошибка связи с серверами Google Gemini (502 Bad Gateway).\n\n"
+            "Попробуйте нажать «🔁 Ещё раз»."
+        )
+    if "503" in combined or "service unavailable" in combined:
+        return (
+            "⚠️ Сервера Google Gemini временно перегружены (503 Service Unavailable).\n\n"
+            "Попробуйте повторить запрос через пару секунд."
+        )
+
+    # Fallback clean error
+    clean_msg = body.strip() if body else err_str
+    try:
+        jd = json.loads(clean_msg)
+        if isinstance(jd, dict):
+            clean_msg = jd.get("error", {}).get("message") or jd.get("message") or clean_msg
+    except Exception:
+        pass
+    return f"⚠️ Ошибка Gemini: {clean_msg}"
+
+
 class GeminiTurn:
     """One streaming request to Gemini Web2API (/v1/chat/completions)."""
 
@@ -227,6 +281,7 @@ class GeminiTurn:
         self._error = None
         self._stopped = False
         self._retried = False
+        self._retry_count = 0
         self._req = None
         self._resp = None
         self.context = 0
@@ -385,7 +440,7 @@ class GeminiTurn:
     def _run(self):
         now_ms = int(time.time() * 1000)
 
-        # Direct video generation via Veo 2 /v1/videos if model is gemini-video
+        # 1. Direct video generation via Veo 2 /v1/videos if model is gemini-video
         if self.model in ("gemini-video", "gemini/gemini-video"):
             try:
                 p_text = ""
@@ -434,6 +489,72 @@ class GeminiTurn:
                 log("gemini-video direct generate_video error:", e)
                 # Fall through to standard chat completion stream if /v1/videos failed
 
+        # 2. Direct music generation via Google Lyria 3.5 if model is gemini-music
+        if self.model in ("gemini-music", "gemini/gemini-music"):
+            try:
+                p_text = ""
+                for m in reversed(self.messages):
+                    if isinstance(m, dict) and m.get("role") == "user":
+                        c = m.get("content")
+                        if isinstance(c, str):
+                            p_text = c
+                            break
+                        elif isinstance(c, list):
+                            p_text = " ".join(item.get("text", "") for item in c if isinstance(item, dict) and item.get("type") == "text")
+                            break
+                if not p_text:
+                    p_text = "Atmospheric synthwave instrumental track"
+
+                with self.lock:
+                    self.parts["r1"] = {
+                        "id": "r1",
+                        "type": "reasoning",
+                        "text": "🎵 Запуск генератора Lyria 3.5... Отправка параметров композиции в Google Cloud...",
+                        "time": {"start": now_ms},
+                    }
+                self.on_change()
+
+                def _music_progress_cb(status_text):
+                    with self.lock:
+                        if "r1" in self.parts:
+                            self.parts["r1"]["text"] = status_text
+                    self.on_change()
+
+                mus_path, mus_desc = generate_music(
+                    p_text,
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                    workdir=self.workdir,
+                    on_progress=_music_progress_cb,
+                )
+                now_done = int(time.time() * 1000)
+                card_text = (
+                    f"🎵 **Музыкальный трек Google Lyria 3.5 успешно создан!**\n\n"
+                    f"🎧 **Стиль / Описание:** {mus_desc.strip()}\n\n"
+                    if mus_desc and mus_desc != "Сгенерированная композиция Google Lyria"
+                    else "🎵 **Музыкальный трек Google Lyria 3.5 успешно создан!**\n\n"
+                )
+                card_text += f"![Сгенерированная музыка]({mus_path})\n\n"
+
+                with self.lock:
+                    if "r1" in self.parts:
+                        self.parts["r1"]["time"]["end"] = now_done
+                    self.parts["t1"] = {
+                        "id": "t1",
+                        "type": "text",
+                        "text": card_text,
+                        "time": {"start": now_ms, "end": now_done},
+                    }
+                self.done.set()
+                self.on_change()
+                return
+            except Exception as e:
+                log("gemini-music direct generate_music error:", e)
+                self._error = format_gemini_error(e)
+                self.done.set()
+                self.on_change()
+                return
+
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Content-Type": "application/json",
@@ -465,11 +586,12 @@ class GeminiTurn:
         content_text = ""
         r_part = None
         t_part = None
+        will_retry = False
 
         try:
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             self._req = req
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=300) as resp:
                 self._resp = resp
                 for raw_line in resp:
                     if self._stopped:
@@ -537,38 +659,68 @@ class GeminiTurn:
                 log("gemini attempting hot-reload of fresh cookies from git/state...")
                 if reload_router_cookies(self.base_url):
                     log("gemini retrying turn after hot-reload...")
+                    will_retry = True
                     self._run()
                     return
+            # If transient 502/503/504 happened before content was yielded and we still have retries
+            if not content_text and not self._stopped and self._retry_count < 2 and e.code in (502, 503, 504):
+                self._retry_count += 1
+                will_retry = True
+                log(f"gemini transient HTTP {e.code}, auto-retrying ({self._retry_count}/2)...")
+                with self.lock:
+                    self.parts["r1"] = {
+                        "id": "r1",
+                        "type": "reasoning",
+                        "text": f"⏳ Запрос требует глубокого анализа... Повторное подключение к Gemini (попытка {self._retry_count}/2)...",
+                        "time": {"start": now_ms},
+                    }
+                self.on_change()
+                time.sleep(2)
+                self._run()
+                return
+
             if not self._stopped:
-                if "cookie" in err_body or "SNlM0e" in err_body:
-                    self._error = (
-                        "⚠️ Сессия Google Gemini устарела. Откройте https://gemini.google.com в браузере Firefox "
-                        "или запустите ~/sync_gemini.sh для синхронизации."
-                    )
-                else:
-                    self._error = f"Gemini HTTP {e.code}: {err_body}"
+                self._error = format_gemini_error(e, err_body)
         except Exception as e:
+            is_timeout = isinstance(e, (urllib.error.URLError, TimeoutError)) or "timed out" in str(e).lower()
+            if not content_text and not self._stopped and self._retry_count < 2 and is_timeout:
+                self._retry_count += 1
+                will_retry = True
+                log(f"gemini transient connection timeout ({e}), auto-retrying ({self._retry_count}/2)...")
+                with self.lock:
+                    self.parts["r1"] = {
+                        "id": "r1",
+                        "type": "reasoning",
+                        "text": f"⏳ Флагманская модель 4 Argon завершает рассуждения... Переподключение (попытка {self._retry_count}/2)...",
+                        "time": {"start": now_ms},
+                    }
+                self.on_change()
+                time.sleep(2)
+                self._run()
+                return
+
             if not self._stopped:
-                self._error = f"Gemini connection error: {e}"
+                self._error = format_gemini_error(e)
                 log("gemini error:", e)
         finally:
-            now_final = int(time.time() * 1000)
-            with self.lock:
-                if "r1" in self.parts and "end" not in self.parts["r1"]["time"]:
-                    self.parts["r1"]["time"]["end"] = now_final
-                if "t1" in self.parts:
-                    if "end" not in self.parts["t1"]["time"]:
-                        self.parts["t1"]["time"]["end"] = now_final
-                    # Post-process media tags
-                    self.parts["t1"]["text"] = self._save_data_media(self.parts["t1"]["text"])
-                    self.parts["t1"]["text"] = self._resolve_google_media(self.parts["t1"]["text"])
-                    # Post-process FollowUp tags and XML artifacts
-                    cleaned_txt, fu = clean_gemini_text_and_extract_followups(self.parts["t1"]["text"])
-                    self.parts["t1"]["text"] = cleaned_txt
-                    if fu:
-                        self.followups.extend(fu)
-            self.done.set()
-            self.on_change()
+            if not will_retry:
+                now_final = int(time.time() * 1000)
+                with self.lock:
+                    if "r1" in self.parts and "end" not in self.parts["r1"]["time"]:
+                        self.parts["r1"]["time"]["end"] = now_final
+                    if "t1" in self.parts:
+                        if "end" not in self.parts["t1"]["time"]:
+                            self.parts["t1"]["time"]["end"] = now_final
+                        # Post-process media tags
+                        self.parts["t1"]["text"] = self._save_data_media(self.parts["t1"]["text"])
+                        self.parts["t1"]["text"] = self._resolve_google_media(self.parts["t1"]["text"])
+                        # Post-process FollowUp tags and XML artifacts
+                        cleaned_txt, fu = clean_gemini_text_and_extract_followups(self.parts["t1"]["text"])
+                        self.parts["t1"]["text"] = cleaned_txt
+                        if fu:
+                            self.followups.extend(fu)
+                self.done.set()
+                self.on_change()
 
 
 _XSRF_CACHE = {}
@@ -834,6 +986,106 @@ def generate_video(prompt, base_url="http://127.0.0.1:8083/v1", api_key="sk-gemi
             log(f"poll video error: {e}")
 
     raise RuntimeError("Время ожидания генерации видео истекло (более 6 минут)")
+
+
+def generate_music(prompt, base_url="http://127.0.0.1:8083/v1", api_key="sk-gemini-internal", workdir=".", on_progress=None):
+    """Generate music using Google Lyria through gemini-web2api-go and Gemini Web polling.
+    Returns (audio_path, description).
+    audio_path is relative path in uploads/ (e.g. uploads/gemini_music_....m4a).
+    """
+    base_url = base_url.rstrip("/")
+    uploads = Path(workdir) / "uploads"
+    uploads.mkdir(parents=True, exist_ok=True)
+
+    if on_progress:
+        on_progress("🎵 Инициализация Google Lyria... Отправка запроса на создание композиции...")
+
+    url = f"{base_url}/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    body = {
+        "model": "gemini-music",
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }
+    data = json.dumps(body).encode("utf-8")
+
+    content_text = ""
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            res = json.load(resp)
+            choices = res.get("choices") or []
+            if choices:
+                msg = choices[0].get("message") or {}
+                content_text = msg.get("content") or ""
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")[:600]
+        log("generate_music HTTP error:", e.code, err_body)
+        # If router returned 502 with media generation succeeded or hNvQHb timeout,
+        # Gemini Web actually accepted the prompt and is creating the track!
+        is_generation_pending = ("media generation succeeded" in err_body or "hNvQHb" in err_body or e.code in (502, 504))
+        if not is_generation_pending:
+            raise RuntimeError(format_gemini_error(e, err_body))
+    except Exception as e:
+        log("generate_music request error:", e)
+
+    # 1. Check if content_text contains base64 audio
+    if content_text:
+        pattern_audio = r"(?:\[audio\]\()?data:(audio\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)\)?"
+        m = re.search(pattern_audio, content_text)
+        if m:
+            b64_data = m.group(2)
+            filename = f"gemini_music_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}.m4a"
+            target = uploads / filename
+            try:
+                target.write_bytes(base64.b64decode(b64_data))
+                clean_desc = re.sub(pattern_audio, "", content_text).strip()
+                return f"uploads/{filename}", clean_desc or "Сгенерированная композиция Google Lyria"
+            except Exception as e:
+                log("save base64 audio error:", e)
+
+    # 2. Check or poll Gemini Web chats for the newly created audio track (=m140)
+    start_poll = time.time()
+    poll_limit = 75  # seconds
+    filename = f"gemini_music_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}.m4a"
+    target = uploads / filename
+
+    while time.time() - start_poll < poll_limit:
+        time.sleep(3.5)
+        elapsed = int(time.time() - start_poll)
+        if on_progress:
+            on_progress(f"🎵 Синтез музыки нейросетью Google Lyria... Сведение аудиотрека ({elapsed} сек)...")
+
+        try:
+            chats = list_web_chats(limit=3)
+            for c in chats:
+                chat_data = get_web_chat(c["id"])
+                msgs = chat_data.get("messages") or []
+                for msg in reversed(msgs):
+                    if msg.get("role") == "assistant":
+                        imgs = msg.get("images") or []
+                        for u in imgs:
+                            if "=m140" in u or "audio" in u or "music" in u:
+                                dest = download_web_media(u, dest=target)
+                                if dest and dest.is_file() and dest.stat().st_size > 500:
+                                    desc = msg.get("content") or content_text or "Сгенерированная композиция Google Lyria"
+                                    desc = clean_gemini_text(desc)
+                                    return f"uploads/{filename}", desc
+        except Exception as e:
+            log("generate_music web polling error:", e)
+
+    if content_text:
+        clean = clean_gemini_text(content_text)
+        if clean:
+            raise RuntimeError(f"Google Lyria сформировала ответ, но аудиофайл недоступен: {clean}")
+
+    raise RuntimeError("Время ожидания генерации музыки Google Lyria истекло. Попробуйте нажать «🔁 Ещё раз».")
 
 
 _USAGE_CACHE = {"data": None, "time": 0}
@@ -1119,6 +1371,9 @@ class GeminiRouter:
 
     def generate_video(self, prompt, on_progress=None):
         return generate_video(prompt, base_url=self.base_url, api_key=self.api_key, workdir=self.workdir, on_progress=on_progress)
+
+    def generate_music(self, prompt, on_progress=None):
+        return generate_music(prompt, base_url=self.base_url, api_key=self.api_key, workdir=self.workdir, on_progress=on_progress)
 
     def get_limits_info(self, db_path="data/gemini.db", force_web=False):
         return get_gemini_limits_info(db_path=db_path, force_web=force_web)
