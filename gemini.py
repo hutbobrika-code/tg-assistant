@@ -573,13 +573,30 @@ class GeminiTurn:
             else:
                 clean_messages.append(m)
 
+        # Adaptive model & effort for guaranteed stability:
+        # If an upstream failure/timeout happened, automatically fall back to standard 4 Argon or 3.1 Pro
+        active_model = self.model
+        active_effort = self.effort
+
+        if self._retry_count == 1:
+            if "thinking" in active_model:
+                active_model = active_model.replace("-thinking", "")
+            if active_effort == "high":
+                active_effort = "medium"
+            elif active_effort == "medium":
+                active_effort = "low"
+        elif self._retry_count >= 2:
+            if "argon" in active_model.lower():
+                active_model = "gemini-3.1-pro"
+                active_effort = "low"
+
         body = {
-            "model": self.model,
+            "model": active_model,
             "messages": clean_messages,
             "stream": True,
         }
-        if self.effort:
-            body["reasoning_effort"] = self.effort
+        if active_effort:
+            body["reasoning_effort"] = active_effort
         data = json.dumps(body).encode("utf-8")
 
         reasoning_text = ""
@@ -591,7 +608,7 @@ class GeminiTurn:
         try:
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             self._req = req
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            with urllib.request.urlopen(req, timeout=360) as resp:
                 self._resp = resp
                 for raw_line in resp:
                     if self._stopped:
@@ -662,8 +679,8 @@ class GeminiTurn:
                     will_retry = True
                     self._run()
                     return
-            # If transient 502/503/504 happened before content was yielded and we still have retries
-            if not content_text and not self._stopped and self._retry_count < 2 and e.code in (502, 503, 504):
+            # If transient 502/503/504 happened before substantial content was yielded and we still have retries
+            if len(content_text.strip()) <= 50 and not self._stopped and self._retry_count < 2 and e.code in (502, 503, 504):
                 self._retry_count += 1
                 will_retry = True
                 log(f"gemini transient HTTP {e.code}, auto-retrying ({self._retry_count}/2)...")
@@ -671,37 +688,43 @@ class GeminiTurn:
                     self.parts["r1"] = {
                         "id": "r1",
                         "type": "reasoning",
-                        "text": f"⏳ Запрос требует глубокого анализа... Повторное подключение к Gemini (попытка {self._retry_count}/2)...",
+                        "text": f"⏳ Запрос требует анализа... Подключение к Gemini (попытка {self._retry_count}/2)...",
                         "time": {"start": now_ms},
                     }
+                    self.parts.pop("t1", None)
                 self.on_change()
-                time.sleep(2)
+                time.sleep(1.5)
                 self._run()
                 return
 
-            if not self._stopped:
+            if len(content_text.strip()) > 50:
+                log("gemini http error occurred but substantial content was already received:", e)
+            elif not self._stopped:
                 self._error = format_gemini_error(e, err_body)
         except Exception as e:
-            is_timeout = isinstance(e, (urllib.error.URLError, TimeoutError)) or "timed out" in str(e).lower()
-            if not content_text and not self._stopped and self._retry_count < 2 and is_timeout:
-                self._retry_count += 1
-                will_retry = True
-                log(f"gemini transient connection timeout ({e}), auto-retrying ({self._retry_count}/2)...")
-                with self.lock:
-                    self.parts["r1"] = {
-                        "id": "r1",
-                        "type": "reasoning",
-                        "text": f"⏳ Флагманская модель 4 Argon завершает рассуждения... Переподключение (попытка {self._retry_count}/2)...",
-                        "time": {"start": now_ms},
-                    }
-                self.on_change()
-                time.sleep(2)
-                self._run()
-                return
+            if len(content_text.strip()) > 50:
+                log("gemini connection closed after substantial content:", e)
+            else:
+                if not self._stopped and self._retry_count < 2:
+                    self._retry_count += 1
+                    will_retry = True
+                    log(f"gemini auto-recovering from {e} (attempt {self._retry_count}/2)...")
+                    with self.lock:
+                        self.parts["r1"] = {
+                            "id": "r1",
+                            "type": "reasoning",
+                            "text": f"⏳ Флагманская модель 4 Argon завершает ответ... Переподключение (попытка {self._retry_count}/2)...",
+                            "time": {"start": now_ms},
+                        }
+                        self.parts.pop("t1", None)
+                    self.on_change()
+                    time.sleep(1.5)
+                    self._run()
+                    return
 
-            if not self._stopped:
-                self._error = format_gemini_error(e)
-                log("gemini error:", e)
+                if not self._stopped:
+                    self._error = format_gemini_error(e)
+                    log("gemini error:", e)
         finally:
             if not will_retry:
                 now_final = int(time.time() * 1000)

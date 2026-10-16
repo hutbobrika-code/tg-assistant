@@ -478,10 +478,16 @@ class GeminiFlowTest(FlowBase):
         self.assertTrue(bot.handle_menu_button(self.chat, "🎨 Фото", {"message_id": 10}))
         self.assertEqual(self.chat.st.get("pending_mode"), "image")
 
-        # Sending text in pending mode
-        bot.process_messages(self.chat, [{"message_id": 11, "text": "рыжий кот в очках"}])
-        self.assertIsNone(self.chat.st.get("pending_mode"))
-        self.assertEqual(self.chat.st.get("model"), "gemini/gemini-image")
+        enqueued = []
+        old_enqueue = self.chat.enqueue
+        self.chat.enqueue = lambda j: enqueued.append(j)
+        try:
+            bot.process_messages(self.chat, [{"message_id": 11, "text": "рыжий кот в очках"}])
+            self.assertIsNone(self.chat.st.get("pending_mode"))
+            self.assertEqual(self.chat.st.get("model"), "gemini/gemini-image")
+            self.assertEqual(len(enqueued), 1)
+        finally:
+            self.chat.enqueue = old_enqueue
 
     def test_limits_view_no_water(self):
         md, _ = bot.limits_view(self.chat)
@@ -588,10 +594,38 @@ class GeminiFlowTest(FlowBase):
         md, kb = bot.music_guide_view(self.chat)
         self.assertIn("Google Lyria", md)
         rows = kb["inline_keyboard"]
-        # Verify 2 buttons per row for preset samples
-        self.assertEqual(len(rows[0]), 2)
-        self.assertEqual(len(rows[1]), 2)
-        self.assertEqual(len(rows[2]), 2)
+        # Clean minimalist layout: only cancel button, no preset buttons
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0]["callback_data"], "cancel_pending")
+
+    def test_direct_prompt_intent_routing(self):
+        enqueued = []
+        old_enqueue = self.chat.enqueue
+        self.chat.enqueue = lambda j: enqueued.append(j)
+        try:
+            # 1. Direct image intent: "нарисуй кота"
+            self.chat.st.pop("pending_mode", None)
+            bot.process_messages(self.chat, [{"message_id": 20, "text": "нарисуй рыжего кота в скафандре"}])
+            self.assertEqual(self.chat.st.get("model"), "gemini/gemini-image")
+            self.assertEqual(len(enqueued), 1)
+
+            # 2. Direct video intent: "сделай видео как взлетает ракета"
+            bot.process_messages(self.chat, [{"message_id": 21, "text": "сделай видео как взлетает ракета"}])
+            self.assertEqual(self.chat.st.get("model"), "gemini/gemini-video")
+            self.assertEqual(len(enqueued), 2)
+
+            # 3. Direct music intent: "создай трек в стиле рок"
+            bot.process_messages(self.chat, [{"message_id": 22, "text": "создай трек в стиле рок"}])
+            self.assertEqual(self.chat.st.get("model"), "gemini/gemini-music")
+            self.assertEqual(len(enqueued), 3)
+
+            # 4. Direct deep research intent: "глубокое исследование квантовых процессоров"
+            bot.process_messages(self.chat, [{"message_id": 23, "text": "глубокое исследование квантовых процессоров"}])
+            self.assertEqual(self.chat.st.get("model"), "gemini/gemini-deep-research")
+            self.assertEqual(len(enqueued), 4)
+        finally:
+            self.chat.enqueue = old_enqueue
+
 
 
 

@@ -348,7 +348,7 @@ def meter(m, v):
 
 
 def effort_for(st, model_id=None):
-    """Reasoning level for a model: the one picked for it, else xhigh, else the deepest it has."""
+    """Reasoning level for a model: the one picked for it, else medium (gemini) / xhigh (others)."""
     model_id = model_id or st["model"]
     variants = model_info(model_id)["variants"]
     if not variants:
@@ -356,6 +356,8 @@ def effort_for(st, model_id=None):
     for v in ((st.get("efforts") or {}).get(model_id), st.get("effort")):
         if v in variants:
             return v
+    if "gemini" in model_id and "medium" in variants:
+        return "medium"
     return "xhigh" if "xhigh" in variants else variants[-1]
 
 
@@ -1721,84 +1723,23 @@ DR_SAMPLES = [
 
 
 def image_guide_view(chat):
-    md = (
-        "## 🎨 Генерация изображений (Gemini Imagen)\n\n"
-        "✨ **Напишите в ответ любое описание** того, что хотите увидеть, "
-        "или нажмите на один из быстрых примеров ниже:\n\n"
-        "Нейросеть Nano Banana / Imagen создаст качественную иллюстрацию и пришлёт её прямо в чат."
-    )
-    rows = []
-    r = []
-    for i, (label, _) in enumerate(IMG_SAMPLES):
-        r.append(btn(label, f"do_prompt:img:{i}"))
-        if len(r) == 2:
-            rows.append(r)
-            r = []
-    if r:
-        rows.append(r)
-    rows.append([btn("‹ В настройки", "settings"), btn("✖️ Отмена", "cancel_pending")])
-    return md, {"inline_keyboard": rows}
+    md = "🎨 **Режим фото.** Напишите, что сгенерировать:"
+    return md, {"inline_keyboard": [[btn("✖️ Отмена", "cancel_pending")]]}
 
 
 def video_guide_view(chat):
-    md = (
-        "## 🎬 Генерация видео (Google Veo 2)\n\n"
-        "✨ **Напишите в ответ описание сцены** для создания видео, "
-        "или нажмите на один из готовых кинематографичных примеров:\n\n"
-        "Кинематографичная модель **Google Veo 2** сгенерирует плавный видеоролик в MP4 и отправит его вам как нативное видео в Telegram.\n\n"
-        "⏱ *Время генерации обычно занимает от 1 до 2 минут.*"
-    )
-    rows = []
-    r = []
-    for i, (label, _) in enumerate(VID_SAMPLES):
-        r.append(btn(label, f"do_prompt:vid:{i}"))
-        if len(r) == 2:
-            rows.append(r)
-            r = []
-    if r:
-        rows.append(r)
-    rows.append([btn("‹ В настройки", "settings"), btn("✖️ Отмена", "cancel_pending")])
-    return md, {"inline_keyboard": rows}
+    md = "🎬 **Режим видео (Google Veo 2).** Напишите описание сцены:"
+    return md, {"inline_keyboard": [[btn("✖️ Отмена", "cancel_pending")]]}
 
 
 def music_guide_view(chat):
-    md = (
-        "## 🎵 Студия музыки Google Lyria 3.5\n\n"
-        "✨ **Напишите в ответ жанр, настроение или описание трека**, "
-        "или выберите один из музыкальных стилей ниже:\n\n"
-        "Модель **Google Lyria 3.5** синтезирует полноценный аудиотрек и отправит его в Telegram с нативным аудиопроигрывателем."
-    )
-    rows = []
-    r = []
-    for i, (label, _) in enumerate(MUS_SAMPLES):
-        r.append(btn(label, f"do_prompt:mus:{i}"))
-        if len(r) == 2:
-            rows.append(r)
-            r = []
-    if r:
-        rows.append(r)
-    rows.append([btn("‹ В настройки", "settings"), btn("✖️ Отмена", "cancel_pending")])
-    return md, {"inline_keyboard": rows}
+    md = "🎵 **Режим музыки (Google Lyria).** Напишите стиль или описание трека:"
+    return md, {"inline_keyboard": [[btn("✖️ Отмена", "cancel_pending")]]}
 
 
 def deepresearch_guide_view(chat):
-    md = (
-        "## 🔬 Gemini Deep Research (Глубокое исследование)\n\n"
-        "✨ **Напишите в ответ тему для комплексного анализа**, "
-        "или выберите тему из готовых примеров ниже:\n\n"
-        "Флагман **Gemini 4 Argon** с максимальной глубиной рассуждений проведёт структурированный всесторонний анализ темы с фактами, таблицами и выводами."
-    )
-    rows = []
-    r = []
-    for i, (label, _) in enumerate(DR_SAMPLES):
-        r.append(btn(label, f"do_prompt:dr:{i}"))
-        if len(r) == 2:
-            rows.append(r)
-            r = []
-    if r:
-        rows.append(r)
-    rows.append([btn("‹ В настройки", "settings"), btn("✖️ Отмена", "cancel_pending")])
-    return md, {"inline_keyboard": rows}
+    md = "🔬 **Deep Research.** Напишите тему для глубокого исследования:"
+    return md, {"inline_keyboard": [[btn("✖️ Отмена", "cancel_pending")]]}
 
 
 def models_view(chat):
@@ -2212,6 +2153,62 @@ def process_messages(chat, msgs):
         echo = send_md(chat, f"🔬 **Deep Research:** _{md_escape(short(body, 60))}_", reply_to=first["message_id"])
         chat.enqueue({"parts": [{"type": "text", "text": dr_text}], "reply_to": echo or first["message_id"]})
         return
+
+    # Direct prompt intent detection: user just types a prompt directly without clicking buttons or menus
+    if body and not quote:
+        img_match = re.match(
+            r"^(?:нарисуй(?:\s+мне)?|сгенерируй\s+(?:мне\s+)?(?:фото|картинку|изображение|арт)|создай\s+(?:мне\s+)?(?:фото|картинку|изображение|арт)|сделай\s+(?:мне\s+)?(?:фото|картинку|изображение|арт)|отрисуй|картинка:|фото:|изображение:)\s*(.+)$",
+            body.strip(),
+            re.IGNORECASE | re.DOTALL,
+        )
+        if img_match:
+            use_model(chat.st, "gemini/gemini-image")
+            echo = send_md(chat, f"🎨 **Генерация фото:** _{md_escape(body)}_", reply_to=first["message_id"])
+            parts.insert(0, {"type": "text", "text": body})
+            chat.enqueue({"parts": parts, "reply_to": echo or first["message_id"]})
+            return
+
+        vid_match = re.match(
+            r"^(?:сгенерируй\s+(?:мне\s+)?видео|создай\s+(?:мне\s+)?видео|сделай\s+(?:мне\s+)?видео|видео:|видеоклип:|ролик:)\s*(.+)$",
+            body.strip(),
+            re.IGNORECASE | re.DOTALL,
+        )
+        if vid_match:
+            prompt_content = vid_match.group(1).strip()
+            use_model(chat.st, "gemini/gemini-video")
+            echo = send_md(chat, f"🎬 **Генерация видео (Veo 2):** _{md_escape(prompt_content)}_", reply_to=first["message_id"])
+            chat.enqueue({"parts": [{"type": "text", "text": prompt_content}], "reply_to": echo or first["message_id"]})
+            return
+
+        mus_match = re.match(
+            r"^(?:сгенерируй\s+(?:мне\s+)?(?:музыку|трек|песню)|создай\s+(?:мне\s+)?(?:музыку|трек|песню)|сделай\s+(?:мне\s+)?(?:музыку|трек|песню)|напиши\s+(?:мне\s+)?(?:музыку|трек|песню)|музыка:|трек:)\s*(.+)$",
+            body.strip(),
+            re.IGNORECASE | re.DOTALL,
+        )
+        if mus_match:
+            prompt_content = mus_match.group(1).strip()
+            use_model(chat.st, "gemini/gemini-music")
+            echo = send_md(chat, f"🎵 **Генерация музыки (Lyria):** _{md_escape(prompt_content)}_", reply_to=first["message_id"])
+            chat.enqueue({"parts": [{"type": "text", "text": prompt_content}], "reply_to": echo or first["message_id"]})
+            return
+
+        dr_match = re.match(
+            r"^(?:глубокое исследование|исследуй(?:\s+тему)?|исследование:)\s*(.+)$",
+            body.strip(),
+            re.IGNORECASE | re.DOTALL,
+        )
+        if dr_match:
+            topic = dr_match.group(1).strip()
+            use_model(chat.st, "gemini/gemini-deep-research")
+            dr_text = (
+                "🔬 [DEEP RESEARCH MODE: Comprehensive Research Report]\n"
+                f"Проведи глубокое, всестороннее исследование по теме:\n\n{topic}\n\n"
+                "Структурируй детальный фактологический отчёт: Резюме (Executive Summary), "
+                "Ключевые аспекты и механизмы, Сравнительный анализ, Факты и ссылки, Перспективы и выводы."
+            )
+            echo = send_md(chat, f"🔬 **Deep Research:** _{md_escape(short(topic, 60))}_", reply_to=first["message_id"])
+            chat.enqueue({"parts": [{"type": "text", "text": dr_text}], "reply_to": echo or first["message_id"]})
+            return
 
     parts.insert(0, {"type": "text", "text": body})
     chat.enqueue({"parts": parts, "reply_to": first["message_id"]})
