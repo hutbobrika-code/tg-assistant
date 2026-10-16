@@ -605,10 +605,11 @@ class GeminiTurn:
         t_part = None
         will_retry = False
 
+        socket_timeout = 50 if ("thinking" in active_model and self._retry_count == 0) else 180
         try:
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             self._req = req
-            with urllib.request.urlopen(req, timeout=360) as resp:
+            with urllib.request.urlopen(req, timeout=socket_timeout) as resp:
                 self._resp = resp
                 for raw_line in resp:
                     if self._stopped:

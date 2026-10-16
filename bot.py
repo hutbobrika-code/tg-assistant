@@ -348,16 +348,19 @@ def meter(m, v):
 
 
 def effort_for(st, model_id=None):
-    """Reasoning level for a model: the one picked for it, else medium (gemini) / xhigh (others)."""
+    """Reasoning level for a model: picked for model, else medium for Gemini, else st effort, else default."""
     model_id = model_id or st["model"]
     variants = model_info(model_id)["variants"]
     if not variants:
         return None
-    for v in ((st.get("efforts") or {}).get(model_id), st.get("effort")):
-        if v in variants:
-            return v
-    if "gemini" in model_id and "medium" in variants:
-        return "medium"
+    picked = (st.get("efforts") or {}).get(model_id)
+    if picked in variants:
+        return picked
+    if "gemini" in model_id:
+        return "medium" if "medium" in variants else variants[0]
+    general = st.get("effort")
+    if general in variants:
+        return general
     return "xhigh" if "xhigh" in variants else variants[-1]
 
 
@@ -2382,6 +2385,8 @@ def on_button(chat, mid, data):
     st = chat.st
     if data == "stop":
         running, _ = chat.stop()
+        if not running:
+            tg_async("deleteMessage", chat_id=chat.id, message_id=mid)
         return "Останавливаю…" if running else "Уже готово"
     if data == "settings":
         show_screen(chat, settings_view, mid)

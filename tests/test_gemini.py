@@ -626,6 +626,19 @@ class GeminiFlowTest(FlowBase):
         finally:
             self.chat.enqueue = old_enqueue
 
+    def test_gemini_effort_defaults_to_medium(self):
+        st = {"model": "gemini/gemini-4-argon", "effort": "high"}
+        self.assertEqual(bot.effort_for(st), "medium")
+        # If explicitly picked for gemini-4-argon in efforts dict:
+        st["efforts"] = {"gemini/gemini-4-argon": "high"}
+        self.assertEqual(bot.effort_for(st), "high")
+
+    def test_on_button_stop_deletes_live_message(self):
+        res = bot.on_button(self.chat, 888, "stop")
+        self.assertEqual(res, "Уже готово")
+
+
+
 
 
 
