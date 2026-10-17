@@ -665,15 +665,7 @@ RUNS_LOCK = threading.Lock()
 
 SPINNER = ("◐", "◓", "◑", "◒")
 STOP_KB = {"inline_keyboard": [[{"text": "⏹ Остановить", "callback_data": "stop"}]]}
-MAIN_REPLY_KEYBOARD = {
-    "keyboard": [
-        [{"text": "🎨 Фото"}, {"text": "🎬 Видео"}, {"text": "🎵 Музыка"}],
-        [{"text": "🔬 Исследование"}, {"text": "📊 Лимиты"}, {"text": "♊ Чаты"}],
-        [{"text": "⚙️ Настройки"}, {"text": "🆕 Новый диалог"}],
-    ],
-    "resize_keyboard": True,
-    "is_persistent": True,
-}
+MAIN_REPLY_KEYBOARD = {"remove_keyboard": True}
 
 
 class LiveMessage:
@@ -1533,7 +1525,7 @@ def welcome_md(chat):
         "- 💬 **Чаты** — синхронизация диалогов с веб-версией Gemini\n"
         "- 🧮 Формулы, графики, таблицы, анализ PDF, документов и изображений\n"
         + claude_line +
-        "\n_Для быстрого доступа используйте кнопки клавиатуры внизу экрана._"
+        "\n_Используйте кнопки прямо в сообщении или пишите любой запрос прямо в чат._"
     )
 
 
@@ -1545,26 +1537,16 @@ def welcome_kb():
     ]}
 
 
-HELP_MD = """## ❓ Команды и возможности ассистента
+HELP_MD = """## ❓ Возможности ассистента
 
-**Генерация контента:**
-- 🎨 `/image <промпт>` (или `/draw`, `/img`) — генерация фото и иллюстраций (**Nano Banana / Imagen**).
-- 🎬 `/video <промпт>` (или `/veo`) — создание видеороликов через **Google Veo 2**.
-- 🎵 `/music <стиль>` (или `/audio`, `/track`) — генерация музыки через **Google Lyria 3.5**.
-- 🔬 `/deepresearch <тема>` — многоэтапное глубокое исследование с фактологическим отчётом (**Gemini 4 Argon High Reasoning**).
+**Генерация прямо текстом в чат:**
+- 🎨 **Фото:** `нарисуй кота в очках`, `сгенерируй фото спорткара`, `картинка: закат на море`
+- 🎬 **Видео:** `сделай видео водопада`, `создай видео как бежит собака`, `видео: ночной город`
+- 🎵 **Музыка:** `сделай музыку в стиле рок`, `создай трек лоуфай`, `напиши музыку для отдыха`
+- 🔬 **Исследование:** `исследуй тему квантовых процессоров`, `глубокое исследование термоядерного синтеза`
 
-**Управление аккаунтом и диалогами:**
-- 📊 `/limits` — просмотр квот моделей, статуса Google One AI Premium и статистики запросов за 24ч.
-- 💬 `/chats` (или `/gemini`) — список диалогов из веб-версии Gemini с возможностью загрузить любой прямо в Telegram.
-- 🆕 `/new` — начать новый чистый диалог.
-- ⏹ `/stop` — немедленно остановить генерацию ответа.
-- ⚙️ `/settings` (или `/model`) — выбор модели (Gemini, Claude, OpenCode) и глубины рассуждений.
-- 🗂 `/sessions` — история всех диалогов.
-- 📁 `/files` — файлы в рабочей директории агента.
-
-**Работа в чате:**
-- Вы можете отправлять фото, аудио, документы, PDF — модель внимательно их изучит.
-- Во время генерации ответа в реальном времени отображаются шаги и мысли модели.
+**Управление и настройки:**
+Все кнопки (выбор модели, лимиты, история диалогов, веб-чаты) находятся прямо в чате под сообщениями.
 """
 
 
@@ -1932,10 +1914,25 @@ def new_dialog(chat, edit_msg=None):
     chat.st.pop("pending_mode", None)
     save_state()
     md = "🆕 **Новый диалог.** Контекст очищен — пишите."
+    inline_kb = {
+        "inline_keyboard": [
+            [btn("🎨 Фото", "prompt_guide:img"), btn("🎬 Видео", "prompt_guide:vid"), btn("🎵 Музыка", "prompt_guide:mus")],
+            [btn("🔬 Deep Research", "prompt_guide:dr"), btn("📊 Лимиты", "limits"), btn("⚙️ Настройки", "settings")],
+        ]
+    }
     if edit_msg:
-        edit_md(chat, edit_msg, md)
+        edit_md(chat, edit_msg, md, markup=inline_kb)
     else:
-        send_md(chat, md, markup=MAIN_REPLY_KEYBOARD)
+        if not chat.st.get("kb_removed"):
+            r = tg("sendMessage", chat_id=chat.id, text="✨", reply_markup={"remove_keyboard": True})
+            if r.get("ok"):
+                try:
+                    tg("deleteMessage", chat_id=chat.id, message_id=r["result"]["message_id"])
+                except Exception:
+                    pass
+            chat.st["kb_removed"] = True
+            save_state()
+        send_md(chat, md, markup=inline_kb)
 
 
 # ---------- incoming updates ----------
@@ -1945,8 +1942,10 @@ def handle_command(chat, msg, text):
     cmd = cmd.split("@")[0].lower()
     arg = arg.strip()
     if cmd == "/start":
-        tg("sendMessage", chat_id=chat.id, text="⚡ Быстрое меню клавиатуры активировано:", reply_markup=MAIN_REPLY_KEYBOARD)
-        send_md(chat, welcome_md(chat), welcome_kb())
+        tg("sendMessage", chat_id=chat.id, text="👋 **Ассистент готов к работе!** Все кнопки и управление находятся прямо в чате.", reply_markup={"remove_keyboard": True}, parse_mode="Markdown")
+        chat.st["kb_removed"] = True
+        save_state()
+        send_md(chat, welcome_md(chat), markup=welcome_kb())
     elif cmd == "/help":
         send_md(chat, HELP_MD)
     elif cmd == "/new":
@@ -2042,6 +2041,10 @@ def file_part(path, mime):
 
 def handle_menu_button(chat, text, msg):
     t = text.strip()
+    if not chat.st.get("kb_removed"):
+        tg("sendMessage", chat_id=chat.id, text="📌 Нижняя панель скрыта — кнопки теперь прямо в чате.", reply_markup={"remove_keyboard": True})
+        chat.st["kb_removed"] = True
+        save_state()
     if t in ("🎨 Фото", "Фото", "🎨 Сгенерировать фото"):
         chat.st["pending_mode"] = "image"
         show_screen(chat, image_guide_view)
@@ -2086,6 +2089,17 @@ def process_messages(chat, msgs):
     first = msgs[0]
     text = "\n".join(m.get("text") or m.get("caption") or "" for m in msgs).strip()
     has_media = any(k in m for m in msgs for k in MEDIA_KEYS)
+
+    if not chat.st.get("kb_removed"):
+        r = tg("sendMessage", chat_id=chat.id, text="✨", reply_markup={"remove_keyboard": True})
+        if r.get("ok"):
+            try:
+                tg("deleteMessage", chat_id=chat.id, message_id=r["result"]["message_id"])
+            except Exception:
+                pass
+        chat.st["kb_removed"] = True
+        save_state()
+
     if len(msgs) == 1 and not has_media:
         if text.startswith("/") and handle_command(chat, first, text):
             return
@@ -2160,19 +2174,20 @@ def process_messages(chat, msgs):
     # Direct prompt intent detection: user just types a prompt directly without clicking buttons or menus
     if body and not quote:
         img_match = re.match(
-            r"^(?:нарисуй(?:\s+мне)?|сгенерируй\s+(?:мне\s+)?(?:фото|картинку|изображение|арт)|создай\s+(?:мне\s+)?(?:фото|картинку|изображение|арт)|сделай\s+(?:мне\s+)?(?:фото|картинку|изображение|арт)|отрисуй|картинка:|фото:|изображение:)\s*(.+)$",
+            r"^(?:нарисуй(?:\s+мне)?|отрисуй(?:\s+мне)?|изобрази(?:\s+мне)?|(?:сгенерируй|создай|сделай)(?:\s+мне)?\s+(?:фото|картинку|изображение|арт|рисунок|иллюстрацию)|картинка:|фото:|изображение:)\s*(.+)$",
             body.strip(),
             re.IGNORECASE | re.DOTALL,
         )
         if img_match:
+            prompt_content = img_match.group(1).strip()
             use_model(chat.st, "gemini/gemini-image")
-            echo = send_md(chat, f"🎨 **Генерация фото:** _{md_escape(body)}_", reply_to=first["message_id"])
-            parts.insert(0, {"type": "text", "text": body})
+            echo = send_md(chat, f"🎨 **Генерация фото:** _{md_escape(prompt_content)}_", reply_to=first["message_id"])
+            parts.insert(0, {"type": "text", "text": prompt_content})
             chat.enqueue({"parts": parts, "reply_to": echo or first["message_id"]})
             return
 
         vid_match = re.match(
-            r"^(?:сгенерируй\s+(?:мне\s+)?видео|создай\s+(?:мне\s+)?видео|сделай\s+(?:мне\s+)?видео|видео:|видеоклип:|ролик:)\s*(.+)$",
+            r"^(?:(?:сгенерируй|создай|сделай|смонтируй)(?:\s+мне)?\s+видео(?:\s*ролик|\s*клип)?|видео:|ролик:|видеоклип:)\s*(.+)$",
             body.strip(),
             re.IGNORECASE | re.DOTALL,
         )
@@ -2184,7 +2199,7 @@ def process_messages(chat, msgs):
             return
 
         mus_match = re.match(
-            r"^(?:сгенерируй\s+(?:мне\s+)?(?:музыку|трек|песню)|создай\s+(?:мне\s+)?(?:музыку|трек|песню)|сделай\s+(?:мне\s+)?(?:музыку|трек|песню)|напиши\s+(?:мне\s+)?(?:музыку|трек|песню)|музыка:|трек:)\s*(.+)$",
+            r"^(?:(?:сгенерируй|создай|сделай|напиши|сочини)(?:\s+мне)?\s+(?:музыку|трек|песню|мелодию|бит)|музыка:|трек:|мелодия:)\s*(.+)$",
             body.strip(),
             re.IGNORECASE | re.DOTALL,
         )
@@ -2196,7 +2211,7 @@ def process_messages(chat, msgs):
             return
 
         dr_match = re.match(
-            r"^(?:глубокое исследование|исследуй(?:\s+тему)?|исследование:)\s*(.+)$",
+            r"^(?:глубокое\s+исследование|исследуй(?:\s+тему)?|проведи\s+исследование(?:\s+по)?|исследование:)\s*(.+)$",
             body.strip(),
             re.IGNORECASE | re.DOTALL,
         )
@@ -2847,20 +2862,12 @@ def cookie_keeper_loop():
 
 
 def setup_profile():
-    tg("setMyCommands", commands=[{"command": c, "description": d} for c, d in [
-        ("image", "🎨 Генерация фото"),
-        ("video", "🎬 Генерация видео (Veo 2)"),
-        ("music", "🎵 Генерация музыки (Lyria)"),
-        ("deepresearch", "🔬 Deep Research (4 Argon)"),
-        ("limits", "📊 Лимиты и статус Gemini"),
-        ("chats", "♊ Веб-чаты Gemini"),
-        ("new", "🆕 Новый диалог"),
-        ("settings", "⚙️ Модель и настройки"),
-        ("stop", "⏹ Остановить ответ"),
-        ("sessions", "🗂 Прошлые диалоги"),
-        ("files", "📁 Файлы агента"),
-        ("help", "❓ Как пользоваться"),
-    ]])
+    # Remove all slash commands and command autocomplete menus
+    tg("deleteMyCommands")
+    tg("deleteMyCommands", scope={"type": "all_private_chats"})
+    tg("deleteMyCommands", scope={"type": "all_group_chats"})
+    tg("deleteMyCommands", scope={"type": "all_chat_administrators"})
+    tg("setChatMenuButton", menu_button={"type": "default"})
     desc = ("AI-ассистент с поддержкой Gemini 4 Argon, Veo 2, Lyria 3.5 и OpenCode: "
             "генерация видео, музыки, картинок, глубокие исследования, код, таблицы и файлы.")
     if (tg("getMyDescription").get("result") or {}).get("description") != desc:

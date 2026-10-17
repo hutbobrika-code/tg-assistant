@@ -390,15 +390,19 @@ class GeminiTurn:
         uploads.mkdir(parents=True, exist_ok=True)
 
         try:
-            chats = list_web_chats(limit=3)
             found_media = []
-            for c in chats:
-                chat_data = get_web_chat(c["id"])
-                for msg in reversed(chat_data.get("messages", [])):
-                    if msg.get("role") == "assistant" and msg.get("images"):
-                        found_media.extend(msg["images"])
-                if found_media:
+            for attempt in range(3):
+                chats = list_web_chats(limit=3)
+                for c in chats:
+                    chat_data = get_web_chat(c["id"])
+                    for msg in reversed(chat_data.get("messages", [])):
+                        if msg.get("role") == "assistant" and msg.get("images"):
+                            found_media.extend(msg["images"])
+                    if found_media:
+                        break
+                if found_media or attempt == 2:
                     break
+                time.sleep(1.0)
 
             for i, match in enumerate(matches):
                 if i < len(found_media):
@@ -585,10 +589,13 @@ class GeminiTurn:
                 active_effort = "medium"
             elif active_effort == "medium":
                 active_effort = "low"
-        elif self._retry_count >= 2:
+        elif self._retry_count == 2:
             if "argon" in active_model.lower():
                 active_model = "gemini-3.1-pro"
                 active_effort = "low"
+        elif self._retry_count >= 3:
+            active_model = "gemini-3.8-flash"
+            active_effort = None
 
         body = {
             "model": active_model,
@@ -605,7 +612,7 @@ class GeminiTurn:
         t_part = None
         will_retry = False
 
-        socket_timeout = 50 if ("thinking" in active_model and self._retry_count == 0) else 180
+        socket_timeout = 150
         try:
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             self._req = req
@@ -681,15 +688,15 @@ class GeminiTurn:
                     self._run()
                     return
             # If transient 502/503/504 happened before substantial content was yielded and we still have retries
-            if len(content_text.strip()) <= 50 and not self._stopped and self._retry_count < 2 and e.code in (502, 503, 504):
+            if len(content_text.strip()) <= 50 and not self._stopped and self._retry_count < 3 and e.code in (502, 503, 504):
                 self._retry_count += 1
                 will_retry = True
-                log(f"gemini transient HTTP {e.code}, auto-retrying ({self._retry_count}/2)...")
+                log(f"gemini transient HTTP {e.code}, auto-retrying ({self._retry_count}/3)...")
                 with self.lock:
                     self.parts["r1"] = {
                         "id": "r1",
                         "type": "reasoning",
-                        "text": f"⏳ Запрос требует анализа... Подключение к Gemini (попытка {self._retry_count}/2)...",
+                        "text": f"⏳ Запрос требует анализа... Подключение к Gemini (попытка {self._retry_count}/3)...",
                         "time": {"start": now_ms},
                     }
                     self.parts.pop("t1", None)
@@ -706,15 +713,15 @@ class GeminiTurn:
             if len(content_text.strip()) > 50:
                 log("gemini connection closed after substantial content:", e)
             else:
-                if not self._stopped and self._retry_count < 2:
+                if not self._stopped and self._retry_count < 3:
                     self._retry_count += 1
                     will_retry = True
-                    log(f"gemini auto-recovering from {e} (attempt {self._retry_count}/2)...")
+                    log(f"gemini auto-recovering from {e} (attempt {self._retry_count}/3)...")
                     with self.lock:
                         self.parts["r1"] = {
                             "id": "r1",
                             "type": "reasoning",
-                            "text": f"⏳ Флагманская модель 4 Argon завершает ответ... Переподключение (попытка {self._retry_count}/2)...",
+                            "text": f"⏳ Gemini формирует ответ... Переподключение (попытка {self._retry_count}/3)...",
                             "time": {"start": now_ms},
                         }
                         self.parts.pop("t1", None)
