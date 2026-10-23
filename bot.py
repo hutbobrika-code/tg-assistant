@@ -48,7 +48,7 @@ ALLOWED = {int(x) for x in re.split(r"[,\s]+", os.environ.get("ALLOWED_IDS") or 
 CLAUDE_BIN = os.path.expanduser(os.environ.get("CLAUDE_BIN", "~/.local/bin/claude"))
 CLAUDE_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", GEMINI_MODELS[0]["id"])
-DEFAULT_EFFORT = os.environ.get("GEMINI_EFFORT", "medium")
+DEFAULT_EFFORT = "xhigh"  # Claude; Gemini starts at medium (effort_for)
 GEMINI_URL = os.environ.get("GEMINI_URL", "http://127.0.0.1:8083/v1")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "sk-gemini-internal")
 WORKDIR = Path(os.path.expanduser(os.environ.get("OC_WORKDIR", str(BASE / "workspace")))).resolve()
@@ -2501,7 +2501,7 @@ def main():
         raise SystemExit(f"getMe: {me}")
     WORKDIR.mkdir(parents=True, exist_ok=True)
     UPLOADS.mkdir(parents=True, exist_ok=True)
-    log(f"@{me['result']['username']} запущен; {DEFAULT_MODEL} ({DEFAULT_EFFORT}); папка {WORKDIR}; "
+    log(f"@{me['result']['username']} запущен; {DEFAULT_MODEL}; папка {WORKDIR}; "
         f"доступ: {sorted(ALLOWED) or 'никому'}")
     setup_profile()
     threading.Thread(target=cookie_keeper_loop, daemon=True).start()

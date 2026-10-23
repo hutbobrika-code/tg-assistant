@@ -6,6 +6,7 @@
 #   deploy/run.sh status  - что сейчас работает
 set -u
 cd "$(dirname "$0")/.."
+export LANG=C.UTF-8 PYTHONUTF8=1  # в голых контейнерах локаль ASCII, а история и логи на русском
 ROUTER_URL=https://github.com/zexadev/gemini-web2api-go/releases/download/v4.22.0/gemini-web2api-go_v4.22.0_linux_amd64
 SELF="$(pwd)/deploy/run.sh"
 
