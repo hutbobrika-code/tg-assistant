@@ -36,21 +36,6 @@ jobs:
         if: env.ENABLED == 'true'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq librsvg2-bin
 
-      - name: Установка OpenCode
-        if: env.ENABLED == 'true'
-        run: |
-          curl -fsSL https://opencode.ai/install | bash
-          echo "$HOME/.opencode/bin" >> $GITHUB_PATH
-
-      - name: Конфигурация OpenCode
-        if: env.ENABLED == 'true'
-        run: |
-          mkdir -p ~/.config/opencode
-          cp deploy/opencode.json ~/.config/opencode/
-          cp deploy/AGENTS.md ~/.config/opencode/
-          mkdir -p workspace
-          cp deploy/AGENTS.md workspace/
-
       - name: Расшифровка состояния
         if: env.ENABLED == 'true'
         env:
@@ -63,13 +48,6 @@ jobs:
           if [ -n "$STATE_KEY" ] && [ -f state/gemini.db.enc ]; then
             openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -salt -pass env:STATE_KEY -in state/gemini.db.enc -out data/gemini.db || true
           fi
-
-      - name: Запуск сервера OpenCode
-        if: env.ENABLED == 'true'
-        run: |
-          $HOME/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4096 &
-          timeout 60 bash -c 'until curl -s http://127.0.0.1:4096/ >/dev/null; do sleep 1; done'
-          echo "OpenCode server ready!"
 
       - name: Запуск Gemini Web2API роутера
         if: env.ENABLED == 'true'

@@ -1,14 +1,14 @@
 [Unit]
-Description=Telegram bot for OpenCode
-After=network-online.target opencode-server.service
-Wants=network-online.target opencode-server.service
+Description=Telegram assistant bot on Gemini
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 User=ocbot
 Group=ocbot
 WorkingDirectory=/home/ocbot/opencode-tg-bot
 Environment=HOME=/home/ocbot
-Environment=PATH=/home/ocbot/.opencode/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/python3 -u /home/ocbot/opencode-tg-bot/bot.py
 Restart=always
 RestartSec=5

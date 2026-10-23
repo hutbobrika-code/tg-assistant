@@ -7,3 +7,6 @@ data/
 .env
 workspace/
 
+logs/
+state.json
+gemini-web2api-go

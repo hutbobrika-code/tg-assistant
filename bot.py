@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Telegram bot on top of an OpenCode server.
+"""Telegram bot on top of Gemini (through the gemini-web2api router).
 
-Each message goes to an OpenCode session. While the agent works, the chat
+Each message goes to the chat's Gemini dialog. While the model works, the chat
 shows a live progress message (status, steps, streamed text) that is edited
 in place; the result is posted as a rich message with formulas and tables
 rendered by Telegram and the steps folded into a <details> block.
@@ -25,7 +25,6 @@ from urllib.parse import urlparse
 
 from cc import ClaudeCode
 from gemini import GEMINI_MODELS, GeminiRouter
-from oc import OpenCode, OpenCodeError
 from render import RICH_LIMIT, md_escape, md_to_html, prepare, split_long
 from tg import Telegram, log
 
@@ -46,12 +45,10 @@ load_env(BASE / ".env")
 
 TOKEN = os.environ.get("TG_TOKEN", "")
 ALLOWED = {int(x) for x in re.split(r"[,\s]+", os.environ.get("ALLOWED_IDS") or os.environ.get("ALLOWED_USERS", "")) if x}
-OC_URL = os.environ.get("OC_URL", "http://127.0.0.1:4096")
-OC_PASSWORD = os.environ.get("OPENCODE_SERVER_PASSWORD", "")
 CLAUDE_BIN = os.path.expanduser(os.environ.get("CLAUDE_BIN", "~/.local/bin/claude"))
 CLAUDE_TOKEN = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-DEFAULT_MODEL = os.environ.get("OC_MODEL", "opencode/muse-spark-1.3-contributor-free")
-DEFAULT_EFFORT = os.environ.get("OC_EFFORT", "xhigh")
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", GEMINI_MODELS[0]["id"])
+DEFAULT_EFFORT = os.environ.get("GEMINI_EFFORT", "medium")
 GEMINI_URL = os.environ.get("GEMINI_URL", "http://127.0.0.1:8083/v1")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "sk-gemini-internal")
 WORKDIR = Path(os.path.expanduser(os.environ.get("OC_WORKDIR", str(BASE / "workspace")))).resolve()
@@ -60,7 +57,6 @@ TIMEOUT = int(os.environ.get("OC_TIMEOUT", "1800"))
 STATE_FILE = BASE / "state.json"
 
 tg = Telegram(TOKEN)
-oc = OpenCode(OC_URL, OC_PASSWORD, WORKDIR)
 claude = ClaudeCode(CLAUDE_BIN, WORKDIR, CLAUDE_TOKEN)
 gemini = GeminiRouter(GEMINI_URL, GEMINI_API_KEY, WORKDIR)
 
@@ -72,7 +68,7 @@ EFFORTS = {  # label, hint
     "xhigh": ("Очень высокий", "глубоко: код и анализ"),
     "max": ("Максимум", "предельно тщательно, дольше всего"),
 }
-CLAUDE_ICON, OPENCODE_ICON, GEMINI_ICON = "✴️", "🔹", "♊"
+CLAUDE_ICON, GEMINI_ICON = "✴️", "♊"
 CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 CLAUDE_MODELS = [
     {"id": "claude/claude-opus-5-5", "name": "Claude Opus 5.5", "short": "Opus 5.5",
@@ -87,7 +83,6 @@ CLAUDE_MODELS = [
      "variants": [], "context": 200_000},
 ]
 DEFAULT_CLAUDE_MODEL = CLAUDE_MODELS[0]["id"]
-DEFAULT_GEMINI_MODEL = GEMINI_MODELS[0]["id"]
 CLAUDE_LIMITS = {}  # latest rate_limit_info from Claude Code
 
 # Telegram's AIActions set (made for AI bots). Custom emoji only render when the bot
@@ -283,7 +278,9 @@ def chat_state(chat_id):
         st.setdefault("model", DEFAULT_MODEL)
         st.setdefault("effort", DEFAULT_EFFORT)
         st.setdefault("agent", "build")
-        st.setdefault("session", None)
+        if not st["model"].startswith(("gemini/", "claude/")):  # left from the OpenCode models
+            st["model"] = DEFAULT_MODEL
+        st.pop("session", None)
         return st
 
 
@@ -295,19 +292,9 @@ def save_state():
         tmp.replace(STATE_FILE)
 
 
-_models = {"at": 0, "list": []}
-
-
 def models():
-    """Claude models first, then Gemini (if connected), then free OpenCode ones."""
-    if time.time() - _models["at"] > 600 or not _models["list"]:
-        try:
-            _models["list"] = oc.models()
-            _models["at"] = time.time()
-        except OpenCodeError as e:
-            log("models:", e)
-    gemini_list = GEMINI_MODELS if gemini.available() else []
-    return (CLAUDE_MODELS if claude.available() else []) + gemini_list + _models["list"]
+    """Gemini models; Claude ones only when Claude Code is connected."""
+    return (CLAUDE_MODELS if claude.available() else []) + GEMINI_MODELS
 
 
 def model_info(model_id):
@@ -316,20 +303,11 @@ def model_info(model_id):
 
 
 def engine_of(model_id):
-    if model_id.startswith("claude/"):
-        return "claude"
-    if model_id.startswith("gemini/"):
-        return "gemini"
-    return "opencode"
+    return "claude" if model_id.startswith("claude/") else "gemini"
 
 
 def engine_icon(model_id):
-    eng = engine_of(model_id)
-    if eng == "claude":
-        return CLAUDE_ICON
-    if eng == "gemini":
-        return GEMINI_ICON
-    return OPENCODE_ICON
+    return CLAUDE_ICON if engine_of(model_id) == "claude" else GEMINI_ICON
 
 
 def short_name(m):
@@ -659,9 +637,6 @@ def edit_md(chat, msg_id, md, markup=None):
 
 # ---------- a single request to the agent ----------
 
-RUNS = {}
-RUNS_LOCK = threading.Lock()
-
 
 SPINNER = ("◐", "◓", "◑", "◒")
 STOP_KB = {"inline_keyboard": [[{"text": "⏹ Остановить", "callback_data": "stop"}]]}
@@ -747,7 +722,7 @@ class LiveMessage:
 
 
 class Run:
-    """One request to an agent. OpenCodeRun and ClaudeRun supply the backend."""
+    """One request to a model. GeminiRun and ClaudeRun supply the backend."""
     engine = ""
 
     def __init__(self, chat, job):
@@ -758,16 +733,12 @@ class Run:
         self.stopped_at = None
         self.timed_out = False
         self.error = None
-        self.retry = None
         self.live = None
         self.followups = []
 
     @property
     def stopped(self):
         return self.stopped_at is not None
-
-    def waiting_user(self):
-        return self.chat.question is not None or self.chat.permission is not None
 
     def changed(self):
         if self.live:
@@ -821,10 +792,6 @@ class Run:
         n = sum(1 for s in steps if s[0] == "tool")
         if self.stopped:
             status = "✋ **Останавливаю**"
-        elif self.waiting_user():
-            status = "❓ **Жду вашего ответа**"
-        elif self.retry:
-            status = f"🔁 **Модель занята, повтор #{self.retry.get('attempt', 1)}**"
         else:
             status = activity_md(parts)
         head = f"{SPINNER[frame % len(SPINNER)]} {status} · {fmt_dur(time.time() - self.started)}"
@@ -851,7 +818,7 @@ class Run:
                 self.timed_out = True
                 self.stop()
                 break
-            if not self.waiting_user() and now - last_typing >= 5:
+            if now - last_typing >= 5:
                 last_typing = now
                 threading.Thread(target=tg, args=("sendChatAction",), daemon=True,
                                  kwargs=dict(_timeout=10, _retries=1, chat_id=self.chat.id, action="typing")).start()
@@ -878,14 +845,6 @@ class Run:
 
     def _finish(self, finished):
         chat = self.chat
-        for kind in ("question", "permission"):
-            pending = getattr(chat, kind)
-            if pending:
-                setattr(chat, kind, None)
-                if pending.get("msg"):
-                    edit_md(chat, pending["msg"], "❓ *Вопрос снят — задача завершилась*" if kind == "question"
-                            else "🔐 *Запрос снят — задача завершилась*")
-
         parts, err = self.collect()
         steps, answer, todos = analyze(parts)
         if not answer:
@@ -915,8 +874,6 @@ class Run:
         files = [f for f in changed_files(self.started - 1) if f not in embedded][:6]
         followups = getattr(self, "followups", [])
         markup = answer_keyboard(files, followups=followups, chat=chat)
-        if isinstance(err, str) and err.startswith(("🔑", "⏳")):
-            markup["inline_keyboard"].append([btn(f"{OPENCODE_ICON} Перейти на бесплатную модель", "fallback")])
 
         reply_to = self.job.get("reply_to") if chat.last_seen != self.job.get("reply_to") else None
         msg_id = None
@@ -934,133 +891,6 @@ class Run:
         info = self.regen_info()
         chat.last_regen = dict(info, engine=self.engine, model=self.model, parts=self.job["parts"],
                                reply_to=self.job.get("reply_to")) if info else None
-
-
-class OpenCodeRun(Run):
-    engine = "opencode"
-
-    def __init__(self, chat, job, sid):
-        super().__init__(chat, job)
-        self.sid = sid
-        self.parts = OrderedDict()
-        self.roles = {}
-        self.lock = threading.Lock()
-        self.busy_seen = False
-        self.user_mid = None
-        self._last_check = time.time()
-        self._idle_checks = 0
-
-    # events from the OpenCode server (SSE thread)
-    def on_event(self, ev):
-        t, p = ev.get("type"), ev.get("properties") or {}
-        changed = False
-        with self.lock:
-            if t == "message.updated":
-                info = p.get("info") or {}
-                self.roles[info.get("id")] = info.get("role")
-            elif t == "message.part.updated":
-                part = p.get("part") or {}
-                # the stream also carries the parts of our own prompt
-                if part.get("type") in ("text", "reasoning", "tool") and \
-                        self.roles.get(part.get("messageID")) == "assistant":
-                    self.parts[part["id"]] = part
-                    changed = True
-            elif t == "message.part.delta":
-                part = self.parts.get(p.get("partID"))
-                if part is not None and p.get("field") == "text":
-                    part["text"] = (part.get("text") or "") + (p.get("delta") or "")
-                    changed = True
-            elif t == "session.status":
-                st = p.get("status") or {}
-                if st.get("type") in ("busy", "retry"):
-                    self.busy_seen = True
-                self.retry = st if st.get("type") == "retry" else None
-                changed = True
-                if st.get("type") == "idle" and self.busy_seen:
-                    self.done.set()
-            elif t == "session.idle" and self.busy_seen:
-                self.done.set()
-            elif t == "session.error":
-                err = p.get("error") or {}
-                if err.get("name") != "MessageAbortedError":
-                    self.error = err
-        if changed:
-            self.changed()
-        if t == "question.asked":
-            threading.Thread(target=ask_question, args=(self.chat, p), daemon=True).start()
-        elif t == "permission.asked":
-            threading.Thread(target=ask_permission, args=(self.chat, p), daemon=True).start()
-
-    def snapshot(self):
-        with self.lock:
-            return [dict(p) for p in self.parts.values()]
-
-    def start(self):
-        with RUNS_LOCK:
-            RUNS[self.sid] = self
-        oc.prompt(self.sid, self.job["parts"], self.model, self.effort, self.chat.st.get("agent"))
-
-    def close(self):
-        with RUNS_LOCK:
-            RUNS.pop(self.sid, None)
-
-    def stop(self):
-        super().stop()
-        oc.abort(self.sid)
-
-    def finished(self, now):
-        # watchdog in case an idle event was missed
-        if now - self._last_check < 4:
-            return False
-        self._last_check = now
-        try:
-            busy = self.sid in oc.status()
-        except OpenCodeError:
-            busy = True
-        if busy:
-            self.busy_seen = True
-            self._idle_checks = 0
-        elif self.busy_seen or now - self.started > 8:
-            self._idle_checks += 1
-        return self._idle_checks >= 2
-
-    def settle(self):
-        for _ in range(20):
-            try:
-                if self.sid not in oc.status():
-                    break
-            except OpenCodeError:
-                break
-            time.sleep(0.5)
-
-    def collect(self):
-        parts, infos = self.snapshot(), []
-        try:
-            msgs = oc.messages(self.sid)
-            idx = max(i for i, m in enumerate(msgs) if m["info"]["role"] == "user")
-            self.user_mid = msgs[idx]["info"]["id"]
-            parts = [p for m in msgs[idx + 1:] for p in m.get("parts", [])
-                     if p.get("type") in ("text", "tool", "reasoning")]
-            infos = [m["info"] for m in msgs[idx + 1:]]
-        except (OpenCodeError, ValueError) as e:
-            log("finish: messages:", e)
-        err = self.error
-        for info in infos:
-            e = info.get("error")
-            if e and e.get("name") == "MessageAbortedError":
-                self.stopped_at = self.stopped_at or time.time()
-            elif e and not err:
-                err = e
-        for info in reversed(infos):
-            tk = info.get("tokens") or {}
-            cache = tk.get("cache") or {}
-            if tk.get("input") or cache.get("read"):
-                self.chat.context = tk.get("input", 0) + cache.get("read", 0) + cache.get("write", 0)
-                break
-        return parts, err
-
-    def regen_info(self):
-        return {"user_mid": self.user_mid, "sid": self.sid} if self.user_mid else None
 
 
 def friendly_claude_error(err):
@@ -1257,30 +1087,6 @@ def answer_keyboard(files, followups=None, chat=None):
     return {"inline_keyboard": rows}
 
 
-def opencode_session(chat, job):
-    """The chat's OpenCode session (created if needed), or None after telling the user."""
-    st = chat.st
-    try:
-        sid = st.get("session")
-        if sid and oc.session(sid) is None:
-            sid = None
-        if not sid:
-            sid = oc.create_session()
-            st["session"] = sid
-            save_state()
-        if job.get("revert"):
-            try:
-                oc.revert(sid, job["revert"])
-            except OpenCodeError as e:
-                log("revert:", e)
-        return sid
-    except OpenCodeError as e:
-        log("execute:", e)
-        send_md(chat, "⚠️ **Сервер OpenCode не отвечает.** Попробуйте через минуту.\n\n" + code(e, 300),
-                reply_to=job.get("reply_to"))
-        return None
-
-
 def execute(chat, job):
     st = chat.st
     job.setdefault("model", st["model"])
@@ -1288,26 +1094,18 @@ def execute(chat, job):
     react(chat.id, job.get("reply_to"), "👀")
     if engine_of(job["model"]) == "claude":
         if not claude.available():
-            send_md(chat, f"🔑 **Claude не подключён.** Выберите бесплатную модель в /settings.",
-                    markup={"inline_keyboard": [[btn(f"{OPENCODE_ICON} Перейти на бесплатную модель", "fallback")]]},
+            send_md(chat, f"🔑 **Claude не подключён.** Выберите модель Gemini в /settings.",
                     reply_to=job.get("reply_to"))
             react(chat.id, job.get("reply_to"))
             return
         run = ClaudeRun(chat, job)
-    elif engine_of(job["model"]) == "gemini":
+    else:
         if not gemini.available():
-            send_md(chat, f"🔑 **Gemini роутер недоступен.** Выберите бесплатную модель в /settings.",
-                    markup={"inline_keyboard": [[btn(f"{OPENCODE_ICON} Перейти на бесплатную модель", "fallback")]]},
+            send_md(chat, "🔑 **Gemini роутер недоступен.** Попробуйте через минуту.",
                     reply_to=job.get("reply_to"))
             react(chat.id, job.get("reply_to"))
             return
         run = GeminiRun(chat, job)
-    else:
-        sid = opencode_session(chat, job)
-        if sid is None:
-            react(chat.id, job.get("reply_to"))
-            return
-        run = OpenCodeRun(chat, job, sid)
     if chat.cancelled:
         react(chat.id, job.get("reply_to"))
         return
@@ -1317,7 +1115,7 @@ def execute(chat, job):
         run.live = LiveMessage(run)
         run.start()
         run.wait()
-    except (OpenCodeError, OSError) as e:
+    except OSError as e:
         log("run:", e)
         run.error = str(e)
     finally:
@@ -1334,8 +1132,6 @@ class Chat:
         self.private = ctype == "private"
         self.queue = Queue()
         self.run = None
-        self.question = None
-        self.permission = None
         self.last_regen = None
         self.last_markup = None
         self.context = None
@@ -1386,11 +1182,6 @@ class Chat:
         with self.lock:
             self.pending -= dropped
             working = self.pending > 0
-        if self.question:
-            try:
-                oc.question_reject(self.question["id"])
-            except OpenCodeError:
-                pass
         run = self.run
         if run:
             run.stop()
@@ -1431,79 +1222,6 @@ def get_chat(chat_id, ctype="private"):
         if chat_id not in CHATS:
             CHATS[chat_id] = Chat(chat_id, ctype)
         return CHATS[chat_id]
-
-
-# ---------- questions and permissions from the agent ----------
-
-def ask_question(chat, props):
-    chat.question = {"id": props["id"], "items": props.get("questions") or [], "idx": 0,
-                     "answers": [], "selected": [], "msg": None}
-    show_question(chat)
-
-
-def question_view(q):
-    item = q["items"][q["idx"]]
-    head = md_escape(item.get("header") or "Вопрос")
-    count = f" · {q['idx'] + 1}/{len(q['items'])}" if len(q["items"]) > 1 else ""
-    md = f"❓ **{head}**{count}\n\n" + prepare(item.get("question", ""), WORKDIR, upload=False)[0]
-    opts = item.get("options") or []
-    described = [o for o in opts if o.get("description") and o["description"] != o.get("label")]
-    if described:
-        md += "\n\n" + "\n".join(f"- **{md_escape(o['label'])}** — {md_escape(o['description'])}" for o in described)
-    if item.get("custom", True):
-        md += "\n\n_Или напишите свой ответ сообщением._"
-    rows = []
-    for i, o in enumerate(opts):
-        mark = "✅ " if i in q["selected"] else ""
-        rows.append([btn(mark + short(o.get("label", "?"), 40), f"q:{i}")])
-    last = []
-    if item.get("multiple"):
-        last.append(btn("✔️ Готово", "q:done", "success"))
-    last.append(btn("⏭ Пропустить", "q:skip"))
-    rows.append(last)
-    return md, {"inline_keyboard": rows}
-
-
-def show_question(chat):
-    q = chat.question
-    if not q or not q["items"]:
-        return
-    md, kb = question_view(q)
-    if q["msg"]:
-        edit_md(chat, q["msg"], md, kb)
-    else:
-        q["msg"] = send_md(chat, md, kb)
-
-
-def answer_question(chat, labels):
-    q = chat.question
-    if not q:
-        return
-    q["answers"].append(labels)
-    q["idx"] += 1
-    q["selected"] = []
-    if q["idx"] < len(q["items"]):
-        show_question(chat)
-        return
-    chat.question = None
-    summary = "\n\n".join(f"❓ {md_escape(it.get('header') or 'Вопрос')} → ✅ **{md_escape(', '.join(a) or '—')}**"
-                          for it, a in zip(q["items"], q["answers"]))
-    if q["msg"]:
-        edit_md(chat, q["msg"], summary)
-    try:
-        oc.question_reply(q["id"], q["answers"])
-    except OpenCodeError as e:
-        send_md(chat, "⚠️ Не удалось передать ответ: " + md_escape(str(e)))
-
-
-def ask_permission(chat, props):
-    pats = ", ".join(props.get("patterns") or [])
-    md = (f"🔐 **Агент просит разрешение**\n\n{md_escape(props.get('permission', ''))}"
-          + (f": {code(pats, 200)}" if pats else ""))
-    kb = {"inline_keyboard": [[btn("✅ Разрешить", "p:once", "success"), btn("♾ Всегда", "p:always"),
-                               btn("⛔ Запретить", "p:reject", "danger")]]}
-    chat.permission = {"id": props["id"], "md": md, "msg": None}
-    chat.permission["msg"] = send_md(chat, md, kb)
 
 
 # ---------- screens ----------
@@ -1569,18 +1287,12 @@ def dialog_line(chat):
     title = None
     if engine_of(st["model"]) == "claude":
         title = (st.get("claude") or {}).get("title")
-    elif engine_of(st["model"]) == "gemini":
+    else:
         gem_st = st.get("gemini") or {}
         title = gem_st.get("title")
         gem_msgs = gem_st.get("messages", [])
         if not title and gem_msgs:
             title = f"Диалог ({len(gem_msgs) // 2} сообщ.)"
-    else:
-        try:
-            sess = oc.session(st["session"]) if st.get("session") else None
-        except OpenCodeError:
-            sess = None
-        title = sess and (sess.get("title") or "без названия")
     if not title:
         return "новый"
     line = f"«{md_escape(short(title, 50))}»"
@@ -1594,11 +1306,13 @@ def settings_view(chat):
     m = model_info(st["model"])
     eff = effort_for(st)
     agent = st.get("agent", "build")
+    on_claude = engine_of(m["id"]) == "claude"
     lines = [f"## ⚙️ Настройки", "", f"### {engine_icon(m['id'])} {md_escape(m['name'])}", ""]
     if eff:
         lines.append(f"- 🧠 **Рассуждения:** {meter(m, eff)} {effort_label(eff)}")
-    lines.append("- 🛠 **Режим:** агент — выполняет команды и меняет файлы" if agent == "build"
-                 else "- 📋 **Режим:** план — только анализирует и предлагает")
+    if on_claude:
+        lines.append("- 🛠 **Режим:** агент — выполняет команды и меняет файлы" if agent == "build"
+                     else "- 📋 **Режим:** план — только анализирует и предлагает")
     lines.append(f"- 💬 **Диалог:** {dialog_line(chat)}")
     if engine_of(m["id"]) == "claude" and limits_text():
         lines.append(f"- 📊 **Лимит подписки Claude:** {limits_text()}")
@@ -1607,8 +1321,9 @@ def settings_view(chat):
     rows = [[btn(f"🤖 Модель · {short_name(m)}", "models")]]
     if eff:
         rows.append([btn(f"🧠 Рассуждения · {effort_label(eff)}", "reasoning")])
-    rows.append([btn(("✓ " if agent == "build" else "") + "🛠 Агент", "a:build", "primary" if agent == "build" else None),
-                 btn(("✓ " if agent == "plan" else "") + "📋 План", "a:plan", "primary" if agent == "plan" else None)])
+    if on_claude:
+        rows.append([btn(("✓ " if agent == "build" else "") + "🛠 Агент", "a:build", "primary" if agent == "build" else None),
+                     btn(("✓ " if agent == "plan" else "") + "📋 План", "a:plan", "primary" if agent == "plan" else None)])
     rows.append([btn("📊 Лимиты Gemini", "limits"), btn("💬 Веб-чаты", "gw:list")])
     rows.append([btn("🗂 Диалоги", "sessions"), btn("📁 Файлы", "files")])
     rows.append([btn("🆕 Новый диалог", "new"), btn("✖️ Закрыть", "close")])
@@ -1736,13 +1451,10 @@ def models_view(chat):
         "Нажмите на нужную модель. Для моделей с рассуждениями можно настроить глубину ответа.",
         "",
     ]
-    if gemini.available():
-        lines.append(f"- {GEMINI_ICON} **Gemini** — Google One AI Premium (4 Argon, Pro, Flash, Veo, Lyria)")
+    lines.append(f"- {GEMINI_ICON} **Gemini** — Google One AI Premium (4 Argon, Pro, Flash, Veo, Lyria)"
+                 + ("" if gemini.available() else " · _роутер сейчас недоступен_"))
     if claude.available():
         lines.append(f"- {CLAUDE_ICON} **Claude** — по вашей подписке")
-    else:
-        lines.append(f"- {CLAUDE_ICON} **Claude** — не подключён")
-    lines.append(f"- {OPENCODE_ICON} **OpenCode** — бесплатные открытые модели")
     rows = []
     for i, m in enumerate(models()):
         on = m["id"] == cur
@@ -1788,28 +1500,18 @@ def claude_dialogs(st):
 
 def sessions_view(chat):
     st = chat.st
-    on_opencode = engine_of(st["model"]) == "opencode"
     on_gemini = engine_of(st["model"]) == "gemini"
     items = [(u, f"{CLAUDE_ICON} {t}", d, c) for u, t, d, c in claude_dialogs(st)]
     cur_gem = st.get("gemini") or {}
     if cur_gem.get("title") or cur_gem.get("messages"):
         items.append((cur_gem.get("updated", time.time()),
                       f"{GEMINI_ICON} {cur_gem.get('title') or 'Диалог Gemini'}", "gw:cur", on_gemini))
-    note = ""
-    try:
-        for s_ in oc.sessions():
-            if not s_.get("parentID"):
-                items.append(((s_.get("time") or {}).get("updated", 0) / 1000,
-                              f"{OPENCODE_ICON} {s_.get('title') or 'без названия'}", f"s:{s_['id']}",
-                              on_opencode and s_["id"] == st.get("session")))
-    except OpenCodeError:
-        note = "\n\n_Список бесплатных диалогов сейчас недоступен._"
     items.sort(key=lambda x: -x[0])
     rows = [[btn(("✓ " if c else "") + short(t, 34) + " · " + ago(u), d, "primary" if c else None)]
             for u, t, d, c in items[:10]]
     rows.append([btn("♊ Веб-чаты Gemini (Google)", "gw:list")])
     rows.append([btn("🆕 Новый диалог", "new"), btn("‹ Назад", "settings")])
-    md = "## 🗂 Диалоги\n\n" + ("Выберите, чтобы продолжить:" if items else "Пока нет сохранённых диалогов.") + note
+    md = "## 🗂 Диалоги\n\n" + ("Выберите, чтобы продолжить:" if items else "Пока нет сохранённых диалогов.")
     return md, {"inline_keyboard": rows}
 
 
@@ -1906,7 +1608,6 @@ def use_model(st, model_id):
 def new_dialog(chat, edit_msg=None):
     chat.stop()
     chat.strip_answer_buttons()
-    chat.st["session"] = None
     archive_claude(chat.st)
     chat.st["gemini"] = {"messages": [], "title": None, "cid": None}
     chat.context = None
@@ -2105,10 +1806,6 @@ def process_messages(chat, msgs):
             return
         if handle_menu_button(chat, text, first):
             return
-    if chat.question and text and not has_media:
-        answer_question(chat, [text])
-        react(chat.id, first["message_id"], "👌")
-        return
     if any("voice" in m for m in msgs) and not text:
         send_md(chat, "🎙 Голосовые пока не понимаю — напишите, пожалуйста, текстом.", reply_to=first["message_id"])
         return
@@ -2344,9 +2041,6 @@ def handle_message(msg):
             flush_caption(chat)
         process_messages(chat, [msg])
         return
-    if chat.question and text and not has_media:
-        process_messages(chat, [msg])
-        return
     if has_media:
         with chat.lock:
             chat.batch.append(msg)
@@ -2524,18 +2218,6 @@ def on_button(chat, mid, data):
         save_state()
         show_screen(chat, settings_view, mid)
         return "Режим: только план" if data == "a:plan" else "Режим: агент"
-    elif data.startswith("s:"):
-        try:
-            sess = oc.session(data[2:])
-        except OpenCodeError:
-            return "Сервер OpenCode не отвечает"
-        if not sess:
-            show_screen(chat, sessions_view, mid)
-            return "Этого диалога уже нет"
-        st["session"] = data[2:]
-        if engine_of(st["model"]) != "opencode":
-            use_model(st, (st.get("last_model") or {}).get("opencode") or DEFAULT_MODEL)
-        switched_dialog(chat, mid, sess.get("title"))
     elif data.startswith("cd:"):
         if not claude.available():
             return "Claude не подключён"
@@ -2645,12 +2327,6 @@ def on_button(chat, mid, data):
             return "Ошибка загрузки веб-чата"
     elif data == "gw:noop":
         return None
-    elif data == "fallback":
-        use_model(st, (st.get("last_model") or {}).get("opencode") or DEFAULT_MODEL)
-        save_state()
-        m = model_info(st["model"])
-        send_md(chat, f"{OPENCODE_ICON} Переключил на **{md_escape(m['name'])}**. Можно повторить вопрос.")
-        return short_name(m)
     elif data.startswith("f:"):
         path = FILE_TOKENS.get(data[2:])
         if not path:
@@ -2667,32 +2343,17 @@ def on_button(chat, mid, data):
         lr = chat.last_regen
         if chat.busy():
             return "Подождите — я ещё отвечаю"
-        current = (st.get("claude") or {}).get("sid") if (lr or {}).get("engine") == "claude" else st.get("session")
-        if not lr or mid != st.get("last_answer") or lr.get("sid") != current:
+        on_claude = (lr or {}).get("engine") == "claude"
+        if not lr or mid != st.get("last_answer") or \
+                (on_claude and lr.get("sid") != (st.get("claude") or {}).get("sid")):
             return "Повторить можно только последний ответ"
         chat.strip_answer_buttons()
         save_state()
-        job = {"parts": lr["parts"], "reply_to": lr["reply_to"], "model": lr["model"]}
-        if lr["engine"] == "claude":
-            job.update(regen=True, base=lr["base"])
-        else:
-            job["revert"] = lr["user_mid"]
+        job = {"parts": lr["parts"], "reply_to": lr["reply_to"], "model": lr["model"], "regen": True}
+        if on_claude:
+            job["base"] = lr["base"]
         chat.enqueue(job)
         return "Генерирую заново"
-    elif data.startswith("q:"):
-        return on_question_button(chat, mid, data)
-    elif data.startswith("p:"):
-        p = chat.permission
-        if not p:
-            return "Запрос уже закрыт"
-        chat.permission = None
-        reply = {"p:once": "once", "p:always": "always"}.get(data, "reject")
-        try:
-            oc.permission_reply(p["id"], reply)
-        except OpenCodeError as e:
-            log("permission reply:", e)
-        verdict = {"once": "✅ разрешено", "always": "♾ разрешено всегда", "reject": "⛔ запрещено"}[reply]
-        edit_md(chat, mid, p["md"] + f"\n\n**{verdict}**")
     return None
 
 
@@ -2707,7 +2368,7 @@ def pick_model(chat, mid, m, effort):
     show_screen(chat, settings_view, mid)
     note = short_name(m) + (f" · {effort_label(effort)}" if effort else "")
     if engine_of(m["id"]) != was:
-        note += "\nУ Claude и бесплатных моделей свои диалоги — контекст не переносится"
+        note += "\nУ Claude и Gemini свои диалоги — контекст не переносится"
     return note
 
 
@@ -2720,51 +2381,6 @@ def switched_dialog(chat, mid, title):
     edit_md(chat, mid, f"💬 Продолжаем диалог «{md_escape(short(title or 'без названия', 60))}» · "
                        f"{engine_icon(m['id'])} {md_escape(short_name(m))}. Пишите.",
             {"inline_keyboard": [[btn("‹ К диалогам", "sessions")]]})
-
-
-def on_question_button(chat, mid, data):
-    q = chat.question
-    if not q:
-        return "Вопрос уже закрыт"
-    item = q["items"][q["idx"]]
-    opts = item.get("options") or []
-    if data == "q:skip":
-        chat.question = None
-        edit_md(chat, mid, f"❓ {md_escape(item.get('header') or 'Вопрос')} → ⏭ пропущен")
-        try:
-            oc.question_reject(q["id"])
-        except OpenCodeError as e:
-            log("question reject:", e)
-    elif data == "q:done":
-        answer_question(chat, [opts[i]["label"] for i in sorted(q["selected"]) if i < len(opts)])
-    else:
-        i = int(data[2:])
-        if i >= len(opts):
-            return None
-        if item.get("multiple"):
-            q["selected"] = [x for x in q["selected"] if x != i] if i in q["selected"] else q["selected"] + [i]
-            show_question(chat)
-        else:
-            answer_question(chat, [opts[i]["label"]])
-    return None
-
-
-def dispatch(ev):
-    """Route a server event to the run waiting on its session."""
-    p = ev.get("properties") or {}
-    sid = p.get("sessionID") or (p.get("part") or {}).get("sessionID") or (p.get("info") or {}).get("sessionID")
-    with RUNS_LOCK:
-        run = RUNS.get(sid) if sid else None
-    if run:
-        try:
-            run.on_event(ev)
-        except Exception:
-            log(traceback.format_exc())
-
-
-def event_loop():
-    for ev in oc.events():
-        dispatch(ev)
 
 
 def cookie_keeper_loop():
@@ -2868,11 +2484,11 @@ def setup_profile():
     tg("deleteMyCommands", scope={"type": "all_group_chats"})
     tg("deleteMyCommands", scope={"type": "all_chat_administrators"})
     tg("setChatMenuButton", menu_button={"type": "default"})
-    desc = ("AI-ассистент с поддержкой Gemini 4 Argon, Veo 2, Lyria 3.5 и OpenCode: "
+    desc = ("AI-ассистент на Gemini 4 Argon, Veo 2 и Lyria 3.5: "
             "генерация видео, музыки, картинок, глубокие исследования, код, таблицы и файлы.")
     if (tg("getMyDescription").get("result") or {}).get("description") != desc:
         tg("setMyDescription", description=desc)
-    short_desc = "Gemini 4 Argon, Veo 2 & OpenCode: видео, музыка, фото, код и исследования"
+    short_desc = "Gemini 4 Argon, Veo 2 & Lyria: видео, музыка, фото, код и исследования"
     if (tg("getMyShortDescription").get("result") or {}).get("short_description") != short_desc:
         tg("setMyShortDescription", short_description=short_desc)
 
@@ -2888,7 +2504,6 @@ def main():
     log(f"@{me['result']['username']} запущен; {DEFAULT_MODEL} ({DEFAULT_EFFORT}); папка {WORKDIR}; "
         f"доступ: {sorted(ALLOWED) or 'никому'}")
     setup_profile()
-    threading.Thread(target=event_loop, daemon=True).start()
     threading.Thread(target=cookie_keeper_loop, daemon=True).start()
     offset = None
     shift_until = None

@@ -24,7 +24,7 @@ class PickerTest(FlowBase):
         md, kb = bot.models_view(self.chat)
         names = [b["text"] for row in kb["inline_keyboard"] for b in row]
         self.assertTrue(names[0].startswith("✴️ Opus 5.5"))
-        self.assertIn("🔹 Muse Spark", names)
+        self.assertTrue(any("♊ 4 Argon" in n for n in names))
         self.assertIn("по вашей подписке", md)
 
     def test_tap_model_then_level(self):
@@ -42,22 +42,22 @@ class PickerTest(FlowBase):
         self.assertEqual(self.chat.st["model"], OPUS)
         self.assertEqual(bot.effort_for(self.chat.st), "max")
         self.assertIn("Opus 5.5 · Максимум", note)
-        self.assertIn("свои диалоги", note)  # switched from the free engine
+        self.assertIn("свои диалоги", note)  # switched from Gemini
         self.assertIn("### ✴️ Claude Opus 5.5", screens(self.tg)[-1])
 
     def test_level_is_remembered_per_model(self):
         lst = bot.models()
         opus = next(k for k, m in enumerate(lst) if m["id"] == OPUS)
-        muse = next(k for k, m in enumerate(lst) if m["id"] == "opencode/muse")
+        pro = next(k for k, m in enumerate(lst) if m["id"] == "gemini/gemini-3.1-pro")
         bot.on_button(self.chat, 50, f"e:{opus}:low")
-        bot.on_button(self.chat, 50, f"e:{muse}:high")
+        bot.on_button(self.chat, 50, f"e:{pro}:high")
         self.assertEqual(bot.effort_for(self.chat.st, OPUS), "low")
-        self.assertEqual(bot.effort_for(self.chat.st, "opencode/muse"), "high")
+        self.assertEqual(bot.effort_for(self.chat.st, "gemini/gemini-3.1-pro"), "high")
 
     def test_model_without_levels_applies_at_once(self):
         lst = bot.models()
         i = next(k for k, m in enumerate(lst) if m["id"] == "claude/claude-haiku-4-5")
-        self.assertEqual(bot.on_button(self.chat, 50, f"m:{i}"), "Haiku 4.5\nУ Claude и бесплатных моделей свои "
+        self.assertEqual(bot.on_button(self.chat, 50, f"m:{i}"), "Haiku 4.5\nУ Claude и Gemini свои "
                                                                  "диалоги — контекст не переносится")
         self.assertIsNone(bot.effort_for(self.chat.st))
 
@@ -70,7 +70,7 @@ class PickerTest(FlowBase):
         self.cc.is_available = False
         self.assertFalse(any(m["id"].startswith("claude/") for m in bot.models()))
         md, _ = bot.models_view(self.chat)
-        self.assertIn("не подключён", md)
+        self.assertNotIn("Claude", md)
 
 
 class ClaudeRunTest(FlowBase):
@@ -129,7 +129,7 @@ class ClaudeRunTest(FlowBase):
         self.assertIn("слово", final)
         self.assertIn("✋ *Остановлено*", final)
 
-    def test_tools_render_like_opencode(self):
+    def test_tools_rendered_as_steps(self):
         self.cc.replies = [Reply(("tool", "bash", {"command": "ls", "description": "Смотрю папку"}),
                                  ("text", "Готово"))]
         self.run_job("что тут?")
@@ -140,10 +140,7 @@ class ClaudeRunTest(FlowBase):
         self.run_job("вопрос")
         final_params = [p for _, p, _ in self.tg.sent("sendRichMessage") if not is_live(p)][-1]
         self.assertIn("закончилась подписка", final_params["rich_message"]["markdown"])
-        self.assertIn("fallback", [b["callback_data"] for b in buttons(final_params)])
-        bot.on_button(self.chat, 9, "fallback")
-        self.assertEqual(bot.engine_of(self.chat.st["model"]), "opencode")
-        self.assertIn("Переключил на", self.finals()[-1])
+        self.assertNotIn("fallback", [b["callback_data"] for b in buttons(final_params)])
         self.assertNotIn("sid", self.chat.st.get("claude", {}))  # the failed fork is not kept
 
     def test_not_connected(self):
@@ -163,17 +160,16 @@ class DialogsTest(FlowBase):
     claude_available = True
 
     def test_both_engines_listed_and_switch(self):
-        self.run_job("бесплатный вопрос", 1)  # an OpenCode dialog
-        oc_sid = self.chat.st["session"]
+        self.run_job("вопрос для Gemini", 1)
         self.chat.st["model"] = OPUS
         self.run_job("вопрос для Claude", 2)
         md, kb = bot.sessions_view(self.chat)
         labels = [b["text"] for row in kb["inline_keyboard"] for b in row]
         self.assertTrue(any(t.startswith("✓ ✴️ вопрос для Claude") for t in labels))
-        self.assertTrue(any(t.startswith("🔹 ") for t in labels))
-        bot.on_button(self.chat, 60, f"s:{oc_sid}")
-        self.assertEqual(bot.engine_of(self.chat.st["model"]), "opencode")
-        self.assertIn("🔹", screens(self.tg)[-1])
+        self.assertTrue(any(t.startswith("♊ вопрос для Gemini") for t in labels))
+        bot.on_button(self.chat, 60, "gw:cur")
+        self.assertEqual(bot.engine_of(self.chat.st["model"]), "gemini")
+        self.assertIn("♊", screens(self.tg)[-1])
         bot.on_button(self.chat, 60, "cd:cur")
         self.assertEqual(self.chat.st["model"], OPUS)
 

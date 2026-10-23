@@ -140,18 +140,16 @@ def message(text=None, mid=1, **extra):
     return m
 
 
-# ---------- a scripted OpenCode server ----------
+# ---------- scripted model turns ----------
 
 import copy  # noqa: E402
 import itertools  # noqa: E402
-
-from oc import OpenCodeError  # noqa: E402
 
 
 class Reply:
     """Script for one assistant turn. Steps:
     ("text", s) - streamed text; ("tool", name, input) - a tool call;
-    ("file", name, bytes) - the agent writes a file; ("question", q) - asks the user;
+    ("file", name, bytes) - the model writes a file;
     ("think", wait, reported_seconds) - reasoning; ("sleep", seconds); ("error", message) - the turn fails.
     """
 
@@ -159,185 +157,6 @@ class Reply:
         self.steps = steps or (("text", "ок"),)
         self.delay = delay
         self.chunk = chunk
-
-
-class FakeOpenCode:
-    def __init__(self):
-        self.store = {}
-        self.busy = set()
-        self.replies = []
-        self.prompts, self.aborted, self.reverted = [], [], []
-        self.question_replies, self.question_rejects, self.permission_replies = [], [], []
-        self.down = False
-        self.session_error = False
-        self._seq = itertools.count(1)
-        self._abort = {}
-        self._questions = {}
-
-    def _id(self, prefix):
-        return f"{prefix}_{next(self._seq):05d}"
-
-    def _check(self):
-        if self.down:
-            raise OpenCodeError("GET /: [Errno 111] Connection refused")
-
-    # API used by the bot
-    def create_session(self):
-        self._check()
-        sid = self._id("ses")
-        self.store[sid] = []
-        return sid
-
-    def session(self, sid):
-        self._check()
-        if self.session_error:
-            raise OpenCodeError("GET /session: timed out")
-        return {"id": sid, "title": "Тестовый диалог", "time": {"updated": time.time() * 1000}} \
-            if sid in self.store else None
-
-    def sessions(self):
-        self._check()
-        return [{"id": s, "title": f"Диалог {s[-2:]}", "time": {"updated": time.time() * 1000}} for s in self.store]
-
-    def status(self):
-        self._check()
-        return {s: {"type": "busy"} for s in self.busy}
-
-    def messages(self, sid):
-        self._check()
-        return copy.deepcopy(self.store.get(sid, []))
-
-    def prompt(self, sid, parts, model, variant=None, agent=None):
-        self._check()
-        self.prompts.append({"sid": sid, "parts": parts, "model": model, "variant": variant, "agent": agent})
-        reply = self.replies.pop(0) if self.replies else Reply()
-        self.busy.add(sid)
-        threading.Thread(target=self._play, args=(sid, parts, reply), daemon=True).start()
-
-    def abort(self, sid):
-        self.aborted.append(sid)
-        if sid in self._abort:
-            self._abort[sid].set()
-
-    def revert(self, sid, mid):
-        self.reverted.append((sid, mid))
-        msgs = self.store[sid]
-        idx = next(i for i, m in enumerate(msgs) if m["info"]["id"] == mid)
-        del msgs[idx:]
-
-    def question_reply(self, qid, answers):
-        self.question_replies.append((qid, answers))
-        self._questions[qid]["answers"] = answers
-        self._questions[qid]["event"].set()
-
-    def question_reject(self, qid):
-        self.question_rejects.append(qid)
-        if qid in self._questions:
-            self._questions[qid]["event"].set()
-
-    def permission_reply(self, pid, reply):
-        self.permission_replies.append((pid, reply))
-
-    def models(self):
-        return [{"id": "opencode/muse", "name": "Muse Spark", "variants": ["low", "high", "xhigh"], "context": 1048576},
-                {"id": "opencode/plain", "name": "Plain", "variants": [], "context": 200000}]
-
-    # event playback
-    def emit(self, type_, **props):
-        bot.dispatch({"type": type_, "properties": copy.deepcopy(props)})
-
-    def _play(self, sid, parts, reply):
-        stop = self._abort[sid] = threading.Event()
-        umid = self._id("msg")
-        user = {"info": {"id": umid, "role": "user", "sessionID": sid},
-                "parts": [{"id": self._id("prt"), "type": "text", "text": parts[0]["text"],
-                           "messageID": umid, "sessionID": sid}]}
-        self.store[sid].append(user)
-        self.emit("message.updated", info=user["info"])
-        self.emit("message.part.updated", part=user["parts"][0])
-        self.emit("session.status", sessionID=sid, status={"type": "busy"})
-        amid = self._id("msg")
-        info = {"id": amid, "role": "assistant", "sessionID": sid,
-                "tokens": {"input": 120, "output": 30, "cache": {"read": 880, "write": 0}}}
-        aparts = []
-        self.store[sid].append({"info": info, "parts": aparts})
-        self.emit("message.updated", info=info)
-
-        def new_part(**kw):
-            p = {"id": self._id("prt"), "messageID": amid, "sessionID": sid, **kw}
-            aparts.append(p)
-            return p
-
-        aborted = False
-        for step in reply.steps:
-            if stop.is_set():
-                aborted = True
-                break
-            kind = step[0]
-            if kind == "text":
-                p = new_part(type="text", text="", time={"start": 1})
-                self.emit("message.part.updated", part=p)
-                s = step[1]
-                for i in range(0, len(s), reply.chunk):
-                    if stop.is_set():
-                        aborted = True
-                        break
-                    p["text"] += s[i:i + reply.chunk]
-                    self.emit("message.part.delta", sessionID=sid, messageID=amid, partID=p["id"],
-                              field="text", delta=s[i:i + reply.chunk])
-                    time.sleep(reply.delay)
-                p["time"]["end"] = 2
-                self.emit("message.part.updated", part=p)
-                if aborted:
-                    break
-            elif kind == "tool":
-                p = new_part(type="tool", tool=step[1], state={"status": "running", "input": step[2]})
-                self.emit("message.part.updated", part=p)
-                time.sleep(reply.delay)
-                p["state"]["status"] = "completed"
-                self.emit("message.part.updated", part=p)
-            elif kind == "file":
-                path = bot.WORKDIR / step[1]
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(step[2])
-            elif kind == "question":
-                qid = self._id("que")
-                self._questions[qid] = {"event": threading.Event(), "answers": None}
-                p = new_part(type="tool", tool="question", state={"status": "running", "input": {}})
-                self.emit("message.part.updated", part=p)
-                self.emit("question.asked", id=qid, sessionID=sid, questions=[step[1]])
-                while not self._questions[qid]["event"].wait(0.05):
-                    if stop.is_set():
-                        break
-                p["state"]["status"] = "completed"
-                self.emit("message.part.updated", part=p)
-            elif kind == "think":
-                t0 = time.time() * 1000
-                p = new_part(type="reasoning", text="", time={"start": t0})
-                self.emit("message.part.updated", part=p)
-                stop.wait(step[1])
-                p["time"]["end"] = t0 + step[2] * 1000  # reported duration may differ from the wait
-                self.emit("message.part.updated", part=p)
-            elif kind == "sleep":
-                stop.wait(step[1])
-            elif kind == "error":
-                info["error"] = {"name": "APIError", "data": {"message": step[1]}}
-                self.emit("session.error", sessionID=sid, error=info["error"])
-                break
-        if aborted:
-            info["error"] = {"name": "MessageAbortedError", "data": {"message": "aborted"}}
-        self.emit("message.updated", info=info)
-        self.busy.discard(sid)
-        self.emit("session.status", sessionID=sid, status={"type": "idle"})
-        self.emit("session.idle", sessionID=sid)
-
-
-def use_fake_oc():
-    fake = FakeOpenCode()
-    bot.oc = fake
-    bot._models["list"] = fake.models()
-    bot._models["at"] = time.time()
-    return fake
 
 
 def wait_idle(chat, timeout=10):
@@ -460,4 +279,31 @@ class FakeClaude:
 def use_fake_claude(available=True):
     fake = FakeClaude(available)
     bot.claude = fake
+    return fake
+
+
+# ---------- a scripted Gemini router ----------
+
+class FakeGemini:
+    def __init__(self, available=True):
+        self.is_available = available
+        self.replies = []
+        self.starts = []
+        self.stops = 0
+        self._seq = itertools.count(1)
+
+    def available(self):
+        return self.is_available
+
+    def new_sid(self):
+        return f"gs-{next(self._seq):03d}"
+
+    def start(self, parts, model_id, effort=None, dialog=None, on_change=None):
+        self.starts.append({"parts": parts, "model": model_id, "effort": effort, "dialog": dialog})
+        return FakeTurn(self, self.replies.pop(0) if self.replies else Reply(), on_change)
+
+
+def use_fake_gemini(available=True):
+    fake = FakeGemini(available)
+    bot.gemini = fake
     return fake
